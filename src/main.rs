@@ -282,7 +282,7 @@ fn run(config: Config) -> io::Result<()> {
 }
 
 fn configure_source(device: &Device, width: u32, height: u32) -> io::Result<Format> {
-    let formats = device.enum_formats()?;
+    let formats = Capture::enum_formats(device)?;
     let requested = if formats
         .iter()
         .any(|format| format.fourcc == FourCC::new(b"MJPG"))
