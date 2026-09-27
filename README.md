@@ -1,6 +1,6 @@
 # vcam
 
-A small Rust beauty-camera bridge for OBS on Linux. It captures a physical USB webcam through V4L2, applies a lightweight skin-smoothing pass, and publishes a standard V4L2 output through `v4l2loopback`.
+A small Rust beauty-camera bridge for OBS on Linux. It captures a physical USB webcam through V4L2, applies a lightweight luma smoothing pass, and publishes a standard V4L2 output through `v4l2loopback`.
 
 ## Requirements
 
@@ -49,11 +49,25 @@ Useful options:
 - `--strength 0`: disable smoothing; `1` is the strongest smoothing
 - `--no-preview`: do not start ffplay (useful when viewing only in OBS)
 
-`--vf` transforms the actual loopback frames, so ffplay and OBS show the same result. `ffplay` opens the processed loopback output automatically by default. In OBS, add **Video Capture Device** and choose the loopback card labeled `vcam`. Set its resolution/FPS to match the bridge output.
+`--vf` transforms the actual loopback frames, so ffplay and OBS show the same result. `ffplay` opens the processed loopback output automatically by default. To compare source and processed output, use three terminals:
+
+```sh
+# terminal 1: processing only
+vcam run --output /dev/video20 --width 1280 --height 720 --framerate 30 \
+  --vf "transpose=1" --strength 0.5 --no-preview
+
+# terminal 2: raw camera
+ffplay -f video4linux2 -input_format mjpeg -video_size 1280x720 -framerate 30 /dev/video1
+
+# terminal 3: processed loopback
+ffplay -f video4linux2 -input_format yuyv422 -video_size 720x1280 -framerate 30 /dev/video20
+```
+
+The current `--strength` effect is a small luma blur/noise reduction pass. It is intentionally not face-aware skin retouching, so differences are subtle on a clean camera image. In OBS, add **Video Capture Device** and choose the loopback card labeled `vcam`. Set its resolution/FPS to match the bridge output.
 
 ## Current scope
 
-The MVP supports MJPEG and YUYV USB camera input and publishes YUYV output. The current Rust processing pass smooths luma using a small neighborhood filter. Face detection, skin segmentation, landmark tracking, makeup overlays, camera hot-plug recovery, and a native OBS UI are intentionally deferred until the basic capture/output path is stable.
+The MVP supports MJPEG and YUYV USB camera input and publishes YUYV output. The current Rust processing pass smooths luma using a single 3x3 neighborhood filter. It is a basic blur/noise reduction effect, not face-aware skin retouching; face detection, skin segmentation, landmark tracking, makeup overlays, camera hot-plug recovery, and a native OBS UI are intentionally deferred until the basic capture/output path is stable.
 
 ## Verification
 

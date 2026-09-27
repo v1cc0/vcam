@@ -289,6 +289,7 @@ fn run(config: Config) -> io::Result<()> {
     let mut capture = MmapStream::with_buffers(&source, Type::VideoCapture, 4)?;
     let mut output_stream = MmapStream::with_buffers(&output, Type::VideoOutput, 4)?;
     let mut preview = None;
+    let mut preview_started = false;
     let mut frame = Vec::with_capacity((source_format.width * source_format.height * 2) as usize);
     let mut rotated = Vec::with_capacity((output_format.width * output_format.height * 2) as usize);
     let mut pixels = Vec::with_capacity((output_format.width * output_format.height) as usize);
@@ -297,13 +298,14 @@ fn run(config: Config) -> io::Result<()> {
         let (input, metadata) = CaptureStream::next(&mut capture)?;
         let input = &input[..(metadata.bytesused as usize).min(input.len())];
         let (output_buffer, output_metadata) = OutputStream::next(&mut output_stream)?;
-        if config.preview && preview.is_none() && !frame.is_empty() {
+        if config.preview && !preview_started && !frame.is_empty() {
             preview = Some(start_preview(
                 &config.output,
                 output_format.width,
                 output_format.height,
                 config.framerate,
             )?);
+            preview_started = true;
         }
         let needed = (source_format.width * source_format.height * 2) as usize;
         let output_bytes = (output_format.width * output_format.height * 2) as usize;
@@ -354,13 +356,19 @@ fn run(config: Config) -> io::Result<()> {
         output_buffer[..output_bytes].copy_from_slice(&rotated);
         output_metadata.bytesused = output_bytes as u32;
         output_metadata.field = 0;
-        if let Some(child) = preview.as_mut() {
-            if let Some(status) = child.try_wait()? {
+        if let Some(status) = preview
+            .as_mut()
+            .map(|child| child.try_wait())
+            .transpose()?
+            .flatten()
+        {
+            if !status.success() {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("ffplay exited with {status}"),
                 ));
             }
+            preview = None;
         }
     }
 }
