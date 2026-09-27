@@ -1,8 +1,9 @@
 use std::env;
 use std::fs;
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, SyncSender};
 use std::time::Duration;
 
 use jpeg_decoder::{Decoder, PixelFormat};
@@ -26,6 +27,7 @@ struct Config {
     height: u32,
     strength: f32,
     preview: bool,
+    compare: bool,
     framerate: u32,
     rotation: Rotation,
 }
@@ -68,6 +70,7 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
         height: DEFAULT_HEIGHT,
         strength: DEFAULT_STRENGTH,
         preview: true,
+        compare: false,
         framerate: 30,
         rotation: Rotation::None,
     };
@@ -90,6 +93,7 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
                         })?;
             }
             "--no-preview" => config.preview = false,
+            "--compare" => config.compare = true,
             "--framerate" | "-framerate" => {
                 config.framerate = parse_u32("--framerate", &next_arg("--framerate", &mut args)?)?;
                 if config.framerate == 0 {
@@ -124,6 +128,9 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
             io::ErrorKind::InvalidInput,
             "strength must be between 0 and 1",
         ));
+    }
+    if config.compare {
+        config.preview = true;
     }
     Ok(config)
 }
@@ -165,7 +172,7 @@ fn print_help() {
     println!(
         "vcam - Rust beauty camera bridge for OBS\n\n\
          Usage:\n  vcam list\n  vcam run [options]\n\n\
-         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --no-preview        Do not launch ffplay to preview the output"
+         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
     );
 }
 
@@ -293,6 +300,11 @@ fn run(config: Config) -> io::Result<()> {
     if config.preview {
         output_stream.set_timeout(Duration::from_millis(200));
     }
+    let (raw_tx, mut raw_preview) = if config.compare {
+        open_raw_preview(source_format.width, source_format.height, config.framerate)?
+    } else {
+        (None, None)
+    };
     let mut preview = None;
     let mut preview_started = false;
     let mut bad_jpegs = 0u32;
@@ -303,7 +315,9 @@ fn run(config: Config) -> io::Result<()> {
     let output_bytes = (output_format.width * output_format.height * 2) as usize;
 
     loop {
-        if preview_stopped(&mut preview)? {
+        if preview_stopped(&mut preview)? || preview_stopped(&mut raw_preview)? {
+            close_child(&mut raw_preview);
+            close_child(&mut preview);
             return Ok(());
         }
 
@@ -347,6 +361,17 @@ fn run(config: Config) -> io::Result<()> {
             }
         }
 
+        if let Some(tx) = &raw_tx {
+            if matches!(
+                tx.try_send(frame.clone()),
+                Err(mpsc::TrySendError::Disconnected(_))
+            ) {
+                close_child(&mut raw_preview);
+                close_child(&mut preview);
+                return Ok(());
+            }
+        }
+
         beautify_yuyv(
             &mut frame,
             source_format.width,
@@ -382,6 +407,11 @@ fn run(config: Config) -> io::Result<()> {
                 output_format.width,
                 output_format.height,
                 config.framerate,
+                if config.compare {
+                    source_format.width
+                } else {
+                    0
+                },
             )?);
             preview_started = true;
         }
@@ -395,12 +425,90 @@ fn preview_stopped(preview: &mut Option<Child>) -> io::Result<bool> {
     Ok(child.try_wait()?.is_some())
 }
 
-fn start_preview(path: &Path, width: u32, height: u32, framerate: u32) -> io::Result<Child> {
-    Command::new("ffplay")
-        .args([
+fn close_child(preview: &mut Option<Child>) {
+    if let Some(mut child) = preview.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn open_raw_preview(
+    width: u32,
+    height: u32,
+    framerate: u32,
+) -> io::Result<(Option<SyncSender<Vec<u8>>>, Option<Child>)> {
+    let mut child = ffplay(raw_preview_args(width, height, framerate), true)?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "raw preview stdin missing"))?;
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+    // ponytail: one queued frame; drop the rest so a slow ffplay cannot stall capture
+    std::thread::spawn(move || {
+        while let Ok(frame) = rx.recv() {
+            if stdin.write_all(&frame).is_err() {
+                break;
+            }
+        }
+    });
+    Ok((Some(tx), Some(child)))
+}
+
+fn raw_preview_args(width: u32, height: u32, framerate: u32) -> Vec<String> {
+    [
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-framedrop",
+        "-window_title",
+        "raw",
+        "-left",
+        "0",
+        "-top",
+        "0",
+        "-f",
+        "rawvideo",
+        "-pixel_format",
+        "yuyv422",
+        "-video_size",
+        &format!("{width}x{height}"),
+        "-framerate",
+        &framerate.to_string(),
+        "-i",
+        "pipe:0",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn start_preview(
+    path: &Path,
+    width: u32,
+    height: u32,
+    framerate: u32,
+    left: u32,
+) -> io::Result<Child> {
+    ffplay(
+        [
             "-hide_banner",
             "-loglevel",
             "warning",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-framedrop",
+            "-window_title",
+            "vcam",
+            "-left",
+            &left.to_string(),
+            "-top",
+            "0",
             "-f",
             "v4l2",
             "-input_format",
@@ -410,15 +518,27 @@ fn start_preview(path: &Path, width: u32, height: u32, framerate: u32) -> io::Re
             "-video_size",
             &format!("{width}x{height}"),
             "-i",
-        ])
-        .arg(path)
-        .spawn()
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("failed to start ffplay preview (install ffmpeg): {error}"),
-            )
-        })
+            &path.display().to_string(),
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        false,
+    )
+}
+
+fn ffplay(args: Vec<String>, piped: bool) -> io::Result<Child> {
+    let mut command = Command::new("ffplay");
+    command.args(&args);
+    if piped {
+        command.stdin(Stdio::piped());
+    }
+    command.spawn().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to start ffplay preview (install ffmpeg): {error}"),
+        )
+    })
 }
 
 fn apply_rotation(
@@ -578,6 +698,20 @@ mod tests {
     fn no_preview_option_disables_ffplay() {
         let config = parse_config(["--no-preview".to_string()].into_iter()).unwrap();
         assert!(!config.preview);
+    }
+
+    #[test]
+    fn compare_opens_side_by_side_preview() {
+        let config = parse_config(["--compare".to_string()].into_iter()).unwrap();
+        assert!(config.compare);
+        assert!(config.preview);
+        let args = super::raw_preview_args(1280, 720, 30);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-window_title" && pair[1] == "raw"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-left" && pair[1] == "0"));
     }
 
     #[test]

@@ -47,20 +47,14 @@ Useful options:
 - `--framerate 30` or `-framerate 30`: request the capture and loopback frame rate
 - `--vf transpose=1` or `-vf transpose=1`: rotate clockwise; `transpose=2` rotates counterclockwise; `hflip` and `vflip` are also supported
 - `--strength 0`: disable smoothing; `1` is the strongest smoothing
+- `--compare`: raw camera on the left, processed `/dev/video20` on the right. Press `q` in either window to stop vcam
 - `--no-preview`: do not start ffplay (useful when viewing only in OBS). Press `q` in the preview to stop vcam; `--no-preview` keeps the bridge running for OBS
 
-`--vf` transforms the actual loopback frames, so ffplay and OBS show the same result. `ffplay` opens the processed loopback output automatically by default. To compare source and processed output, use three terminals:
+`--vf` transforms the actual loopback frames, so ffplay and OBS show the same result. `ffplay` opens the processed loopback output automatically by default. The USB camera cannot be opened by a second `ffplay` while vcam is capturing, so `--compare` feeds the left window from the frame vcam just decoded:
 
 ```sh
-# terminal 1: processing only
 vcam run --output /dev/video20 --width 1280 --height 720 --framerate 30 \
-  --vf "transpose=1" --strength 0.5 --no-preview
-
-# terminal 2: raw camera
-ffplay -f video4linux2 -input_format mjpeg -video_size 1280x720 -framerate 30 /dev/video1
-
-# terminal 3: processed loopback
-ffplay -f video4linux2 -input_format yuyv422 -video_size 720x1280 -framerate 30 /dev/video20
+  --vf "transpose=1" --strength 0.5 --compare
 ```
 
 The current `--strength` effect is a small luma blur/noise reduction pass. It is intentionally not face-aware skin retouching, so differences are subtle on a clean camera image. In OBS, add **Video Capture Device** and choose the loopback card labeled `vcam`. Set its resolution/FPS to match the bridge output.
