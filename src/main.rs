@@ -25,6 +25,18 @@ struct Config {
     height: u32,
     strength: f32,
     preview: bool,
+    framerate: u32,
+    rotation: Rotation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rotation {
+    None,
+    Clockwise,
+    CounterClockwise,
+    HalfTurn,
+    HorizontalFlip,
+    VerticalFlip,
 }
 
 fn main() -> io::Result<()> {
@@ -55,6 +67,8 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
         height: DEFAULT_HEIGHT,
         strength: DEFAULT_STRENGTH,
         preview: true,
+        framerate: 30,
+        rotation: Rotation::None,
     };
 
     while let Some(arg) = args.next() {
@@ -75,6 +89,16 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
                         })?;
             }
             "--no-preview" => config.preview = false,
+            "--framerate" | "-framerate" => {
+                config.framerate = parse_u32("--framerate", &next_arg("--framerate", &mut args)?)?;
+                if config.framerate == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--framerate must be greater than zero",
+                    ));
+                }
+            }
+            "--vf" | "-vf" => config.rotation = parse_video_filter(&next_arg("--vf", &mut args)?)?,
             "--help" | "-h" => {
                 print_help();
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "help requested"));
@@ -88,10 +112,10 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
         }
     }
 
-    if config.width == 0 || config.height == 0 || config.width % 2 != 0 {
+    if config.width == 0 || config.height == 0 || config.width % 2 != 0 || config.height % 2 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "width must be a positive even integer and height must be greater than zero",
+            "width and height must be positive even integers",
         ));
     }
     if !(0.0..=1.0).contains(&config.strength) {
@@ -101,6 +125,21 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
         ));
     }
     Ok(config)
+}
+
+fn parse_video_filter(filter: &str) -> io::Result<Rotation> {
+    match filter {
+        "transpose=1" | "transpose=clock" => Ok(Rotation::Clockwise),
+        "transpose=2" | "transpose=cclock" => Ok(Rotation::CounterClockwise),
+        "transpose=2,transpose=2" | "transpose=clock,transpose=clock" => Ok(Rotation::HalfTurn),
+        "transpose=1,transpose=1" => Ok(Rotation::HalfTurn),
+        "hflip" => Ok(Rotation::HorizontalFlip),
+        "vflip" => Ok(Rotation::VerticalFlip),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported --vf filter: {filter}"),
+        )),
+    }
 }
 
 fn next_arg(name: &str, args: &mut impl Iterator<Item = String>) -> io::Result<String> {
@@ -125,7 +164,7 @@ fn print_help() {
     println!(
         "vcam - Rust beauty camera bridge for OBS\n\n\
          Usage:\n  vcam list\n  vcam run [options]\n\n\
-         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --no-preview        Do not launch ffplay to preview the output"
+         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --no-preview        Do not launch ffplay to preview the output"
     );
 }
 
@@ -191,29 +230,42 @@ fn select_source(explicit: Option<&Path>, output: &Path) -> io::Result<PathBuf> 
 fn run(config: Config) -> io::Result<()> {
     let source_path = select_source(config.source.as_deref(), &config.output)?;
     println!(
-        "source={} output={} requested={}x{} strength={:.2}",
+        "source={} output={} requested={}x{} fps={} strength={:.2}",
         source_path.display(),
         config.output.display(),
         config.width,
         config.height,
+        config.framerate,
         config.strength
     );
 
     let source = Device::with_path(&source_path)?;
     let source_format = configure_source(&source, config.width, config.height)?;
+    Capture::set_params(
+        &source,
+        &v4l::video::capture::Parameters::with_fps(config.framerate),
+    )?;
     let output = Device::with_path(&config.output)?;
+    let (output_width, output_height) = if matches!(
+        config.rotation,
+        Rotation::Clockwise | Rotation::CounterClockwise
+    ) {
+        (source_format.height, source_format.width)
+    } else {
+        (source_format.width, source_format.height)
+    };
     let output_format = Output::set_format(
         &output,
-        &Format::new(
-            source_format.width,
-            source_format.height,
-            FourCC::new(b"YUYV"),
-        ),
+        &Format::new(output_width, output_height, FourCC::new(b"YUYV")),
+    )?;
+    Output::set_params(
+        &output,
+        &v4l::video::output::Parameters::with_fps(config.framerate),
     )?;
 
     if output_format.fourcc != FourCC::new(b"YUYV")
-        || output_format.width != source_format.width
-        || output_format.height != source_format.height
+        || output_format.width != output_width
+        || output_format.height != output_height
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -238,6 +290,8 @@ fn run(config: Config) -> io::Result<()> {
     let mut output_stream = MmapStream::with_buffers(&output, Type::VideoOutput, 4)?;
     let mut preview = None;
     let mut frame = Vec::with_capacity((source_format.width * source_format.height * 2) as usize);
+    let mut rotated = Vec::with_capacity((output_format.width * output_format.height * 2) as usize);
+    let mut pixels = Vec::with_capacity((output_format.width * output_format.height) as usize);
 
     loop {
         let (input, metadata) = CaptureStream::next(&mut capture)?;
@@ -248,10 +302,12 @@ fn run(config: Config) -> io::Result<()> {
                 &config.output,
                 output_format.width,
                 output_format.height,
+                config.framerate,
             )?);
         }
         let needed = (source_format.width * source_format.height * 2) as usize;
-        if output_buffer.len() < needed {
+        let output_bytes = (output_format.width * output_format.height * 2) as usize;
+        if output_buffer.len() < output_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "loopback buffer is smaller than the requested frame",
@@ -287,8 +343,16 @@ fn run(config: Config) -> io::Result<()> {
             source_format.height,
             config.strength,
         );
-        output_buffer[..needed].copy_from_slice(&frame);
-        output_metadata.bytesused = needed as u32;
+        apply_rotation(
+            &frame,
+            source_format.width,
+            source_format.height,
+            config.rotation,
+            &mut rotated,
+            &mut pixels,
+        );
+        output_buffer[..output_bytes].copy_from_slice(&rotated);
+        output_metadata.bytesused = output_bytes as u32;
         output_metadata.field = 0;
         if let Some(child) = preview.as_mut() {
             if let Some(status) = child.try_wait()? {
@@ -301,7 +365,7 @@ fn run(config: Config) -> io::Result<()> {
     }
 }
 
-fn start_preview(path: &Path, width: u32, height: u32) -> io::Result<Child> {
+fn start_preview(path: &Path, width: u32, height: u32, framerate: u32) -> io::Result<Child> {
     Command::new("ffplay")
         .args([
             "-hide_banner",
@@ -311,6 +375,8 @@ fn start_preview(path: &Path, width: u32, height: u32) -> io::Result<Child> {
             "v4l2",
             "-input_format",
             "yuyv422",
+            "-framerate",
+            &framerate.to_string(),
             "-video_size",
             &format!("{width}x{height}"),
             "-i",
@@ -323,6 +389,53 @@ fn start_preview(path: &Path, width: u32, height: u32) -> io::Result<Child> {
                 format!("failed to start ffplay preview (install ffmpeg): {error}"),
             )
         })
+}
+
+fn apply_rotation(
+    source: &[u8],
+    width: u32,
+    height: u32,
+    rotation: Rotation,
+    output: &mut Vec<u8>,
+    pixels: &mut Vec<[u8; 3]>,
+) {
+    let (out_width, out_height) =
+        if matches!(rotation, Rotation::Clockwise | Rotation::CounterClockwise) {
+            (height as usize, width as usize)
+        } else {
+            (width as usize, height as usize)
+        };
+    pixels.clear();
+    pixels.resize(out_width * out_height, [0; 3]);
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let pair = y * width as usize * 2 + (x / 2) * 4;
+            let (dx, dy) = match rotation {
+                Rotation::None => (x, y),
+                Rotation::Clockwise => (height as usize - 1 - y, x),
+                Rotation::CounterClockwise => (y, width as usize - 1 - x),
+                Rotation::HalfTurn => (width as usize - 1 - x, height as usize - 1 - y),
+                Rotation::HorizontalFlip => (width as usize - 1 - x, y),
+                Rotation::VerticalFlip => (x, height as usize - 1 - y),
+            };
+            pixels[dy * out_width + dx] = [
+                source[pair + if x % 2 == 0 { 0 } else { 2 }],
+                source[pair + 1],
+                source[pair + 3],
+            ];
+        }
+    }
+
+    output.clear();
+    output.reserve(out_width * out_height * 2);
+    for pair in pixels.chunks_exact(2) {
+        output.extend_from_slice(&[
+            pair[0][0],
+            ((pair[0][1] as u16 + pair[1][1] as u16) / 2) as u8,
+            pair[1][0],
+            ((pair[0][2] as u16 + pair[1][2] as u16) / 2) as u8,
+        ]);
+    }
 }
 
 fn configure_source(device: &Device, width: u32, height: u32) -> io::Result<Format> {
@@ -421,7 +534,9 @@ fn beautify_yuyv(frame: &mut [u8], width: u32, height: u32, strength: f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{beautify_yuyv, parse_config, rgb_to_yuv};
+    use super::{
+        apply_rotation, beautify_yuyv, parse_config, parse_video_filter, rgb_to_yuv, Rotation,
+    };
 
     #[test]
     fn rgb_conversion_has_expected_black_and_white_values() {
@@ -433,6 +548,33 @@ mod tests {
     fn no_preview_option_disables_ffplay() {
         let config = parse_config(["--no-preview".to_string()].into_iter()).unwrap();
         assert!(!config.preview);
+    }
+
+    #[test]
+    fn filters_parse_and_reject_unhandled_graphs() {
+        assert_eq!(
+            parse_video_filter("transpose=1").unwrap(),
+            Rotation::Clockwise
+        );
+        assert_eq!(parse_video_filter("vflip").unwrap(), Rotation::VerticalFlip);
+        assert!(parse_video_filter("transpose=1,hflip").is_err());
+        let config = parse_config(
+            ["-framerate", "30", "-vf", "transpose=1"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap();
+        assert_eq!(config.framerate, 30);
+        assert_eq!(config.rotation, Rotation::Clockwise);
+    }
+
+    #[test]
+    fn clockwise_rotation_reorders_yuyv_pixels() {
+        let source = [10, 128, 20, 128, 30, 128, 40, 128];
+        let mut output = Vec::new();
+        let mut pixels = Vec::new();
+        apply_rotation(&source, 2, 2, Rotation::Clockwise, &mut output, &mut pixels);
+        assert_eq!(output, [30, 128, 10, 128, 40, 128, 20, 128]);
     }
 
     #[test]

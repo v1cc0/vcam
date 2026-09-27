@@ -44,10 +44,12 @@ Useful options:
 - `--source /dev/video1`: select a specific camera
 - `--output /dev/video20`: select the loopback device consumed by OBS
 - `--width 1280 --height 720`: request the camera capture size
+- `--framerate 30` or `-framerate 30`: request the capture and loopback frame rate
+- `--vf transpose=1` or `-vf transpose=1`: rotate clockwise; `transpose=2` rotates counterclockwise; `hflip` and `vflip` are also supported
 - `--strength 0`: disable smoothing; `1` is the strongest smoothing
 - `--no-preview`: do not start ffplay (useful when viewing only in OBS)
 
-`ffplay` opens the processed loopback output automatically by default. In OBS, add **Video Capture Device** and choose the loopback card labeled `vcam`. Set its resolution/FPS to match the bridge output.
+`--vf` transforms the actual loopback frames, so ffplay and OBS show the same result. `ffplay` opens the processed loopback output automatically by default. In OBS, add **Video Capture Device** and choose the loopback card labeled `vcam`. Set its resolution/FPS to match the bridge output.
 
 ## Current scope
 
