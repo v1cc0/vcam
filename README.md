@@ -47,7 +47,7 @@ Useful options:
 - `--framerate 30` or `-framerate 30`: request the capture and loopback frame rate
 - `--vf transpose=1` or `-vf transpose=1`: rotate clockwise; `transpose=2` rotates counterclockwise; `hflip` and `vflip` are also supported
 - `--strength 0`: disable smoothing; `1` is the strongest smoothing
-- `--slim 0.67`: squash the whole frame vertically. `0` keeps 720, `0.67` is about 480, `1` is 360. Width stays 1280
+- `--slim 0.33`: squash the whole frame vertically. From 720: `0.33` is 600, `0.67` is 480, `1` is 360. Width stays 1280
 - `--compare`: raw camera on the left, processed `/dev/video20` on the right. Press `q` in either window to stop vcam
 - `--no-preview`: do not start ffplay (useful when viewing only in OBS). Press `q` in the preview to stop vcam; `--no-preview` keeps the bridge running for OBS
 

@@ -180,7 +180,7 @@ fn print_help() {
     println!(
         "vcam - Rust beauty camera bridge for OBS\n\n\
          Usage:\n  vcam list\n  vcam run [options]\n\n\
-         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze frame height. 0 keeps it, 1 halves it (default: 0)\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
+         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze height. 0.33, 0.67, 1 map 720 to 600, 480, 360 (default: 0)\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
     );
 }
 
@@ -608,8 +608,14 @@ fn squeezed_height(height: u32, slim: f32) -> u32 {
     if slim == 0.0 {
         return height;
     }
-    // ponytail: slim 1 halves height (720 -> 360). Nearest even so YUYV stays aligned.
-    let scaled = (height as f32 * (1.0 - 0.5 * slim)).round() as u32;
+    // ponytail: 0.33/0.67/1 are the 600/480/360 steps on a 720 frame. Other values stay linear.
+    let scaled = match (slim * 100.0).round() as i32 {
+        0 => height,
+        33 => height * 5 / 6,
+        67 => height * 2 / 3,
+        100 => height / 2,
+        _ => (height as f32 * (1.0 - 0.5 * slim)).round() as u32,
+    };
     let even = if scaled % 2 == 0 { scaled } else { scaled + 1 };
     even.clamp(2, height)
 }
@@ -832,8 +838,9 @@ mod tests {
     #[test]
     fn squeeze_maps_slim_onto_half_height() {
         assert_eq!(super::squeezed_height(720, 0.0), 720);
-        assert_eq!(super::squeezed_height(720, 1.0), 360);
+        assert_eq!(super::squeezed_height(720, 0.33), 600);
         assert_eq!(super::squeezed_height(720, 0.67), 480);
+        assert_eq!(super::squeezed_height(720, 1.0), 360);
 
         let mut frame = vec![0u8; 2 * 4 * 2];
         for y in 0..4usize {
