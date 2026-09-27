@@ -18,6 +18,7 @@ use v4l::Device;
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 const DEFAULT_STRENGTH: f32 = 0.35;
+const DEFAULT_SLIM: f32 = 0.0;
 
 #[derive(Debug)]
 struct Config {
@@ -26,6 +27,7 @@ struct Config {
     width: u32,
     height: u32,
     strength: f32,
+    slim: f32,
     preview: bool,
     compare: bool,
     framerate: u32,
@@ -69,6 +71,7 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
         width: DEFAULT_WIDTH,
         height: DEFAULT_HEIGHT,
         strength: DEFAULT_STRENGTH,
+        slim: DEFAULT_SLIM,
         preview: true,
         compare: false,
         framerate: 30,
@@ -91,6 +94,11 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
                                 "--strength must be a number",
                             )
                         })?;
+            }
+            "--slim" => {
+                config.slim = next_arg("--slim", &mut args)?.parse::<f32>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--slim must be a number")
+                })?;
             }
             "--no-preview" => config.preview = false,
             "--compare" => config.compare = true,
@@ -123,10 +131,10 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
             "width and height must be positive even integers",
         ));
     }
-    if !(0.0..=1.0).contains(&config.strength) {
+    if !(0.0..=1.0).contains(&config.strength) || !(0.0..=1.0).contains(&config.slim) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "strength must be between 0 and 1",
+            "strength and slim must be between 0 and 1",
         ));
     }
     if config.compare {
@@ -172,7 +180,7 @@ fn print_help() {
     println!(
         "vcam - Rust beauty camera bridge for OBS\n\n\
          Usage:\n  vcam list\n  vcam run [options]\n\n\
-         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
+         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Thin the centered face, 0..1 (default: 0)\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
     );
 }
 
@@ -238,13 +246,14 @@ fn select_source(explicit: Option<&Path>, output: &Path) -> io::Result<PathBuf> 
 fn run(config: Config) -> io::Result<()> {
     let source_path = select_source(config.source.as_deref(), &config.output)?;
     println!(
-        "source={} output={} requested={}x{} fps={} strength={:.2}",
+        "source={} output={} requested={}x{} fps={} strength={:.2} slim={:.2}",
         source_path.display(),
         config.output.display(),
         config.width,
         config.height,
         config.framerate,
-        config.strength
+        config.strength,
+        config.slim
     );
 
     let source = Device::with_path(&source_path)?;
@@ -372,6 +381,12 @@ fn run(config: Config) -> io::Result<()> {
             }
         }
 
+        slim_yuyv(
+            &mut frame,
+            source_format.width,
+            source_format.height,
+            config.slim,
+        );
         beautify_yuyv(
             &mut frame,
             source_format.width,
@@ -588,6 +603,87 @@ fn apply_rotation(
     }
 }
 
+fn slim_yuyv(frame: &mut [u8], width: u32, height: u32, amount: f32) {
+    if amount == 0.0 {
+        return;
+    }
+    let src = frame.to_vec();
+    let width = width as usize;
+    let height = height as usize;
+    for y in 0..height {
+        for x in (0..width).step_by(2) {
+            let left = sample_slim(&src, width, height, x, y, amount);
+            let right = sample_slim(&src, width, height, x + 1, y, amount);
+            let pair = (y * width + x) * 2;
+            frame[pair] = left[0];
+            frame[pair + 1] = ((left[1] as u16 + right[1] as u16) / 2) as u8;
+            frame[pair + 2] = right[0];
+            frame[pair + 3] = ((left[2] as u16 + right[2] as u16) / 2) as u8;
+        }
+    }
+}
+
+fn sample_slim(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    amount: f32,
+) -> [u8; 3] {
+    let sx = face_source_x(x as f32, y as f32, width as f32, height as f32, amount);
+    sample_yuyv(src, width, height, sx, y as f32)
+}
+
+fn face_source_x(x: f32, y: f32, width: f32, height: f32, amount: f32) -> f32 {
+    // ponytail: fixed center ellipse, not a tracked face. Landmarks if the user leaves center.
+    let cx = (width - 1.0) * 0.5;
+    let cy = (height - 1.0) * 0.46;
+    let rx = width * 0.22;
+    let ry = height * 0.34;
+    let dx = x - cx;
+    let dy = y - cy;
+    let ex = dx / rx;
+    let ey = dy / ry;
+    let r2 = ex * ex + ey * ey;
+    if r2 >= 1.0 {
+        return x;
+    }
+    let mask = (1.0 - r2) * ex.abs();
+    cx + dx * (1.0 + amount * mask)
+}
+
+fn sample_yuyv(src: &[u8], width: usize, height: usize, x: f32, y: f32) -> [u8; 3] {
+    let x = x.clamp(0.0, (width - 1) as f32);
+    let y = y.clamp(0.0, (height - 1) as f32);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let p00 = yuyv_pixel(src, width, x0, y0);
+    let p10 = yuyv_pixel(src, width, x1, y0);
+    let p01 = yuyv_pixel(src, width, x0, y1);
+    let p11 = yuyv_pixel(src, width, x1, y1);
+    let mut out = [0u8; 3];
+    for channel in 0..3 {
+        let top = p00[channel] as f32 * (1.0 - fx) + p10[channel] as f32 * fx;
+        let bottom = p01[channel] as f32 * (1.0 - fx) + p11[channel] as f32 * fx;
+        out[channel] = (top * (1.0 - fy) + bottom * fy).round() as u8;
+    }
+    out
+}
+
+fn yuyv_pixel(src: &[u8], width: usize, x: usize, y: usize) -> [u8; 3] {
+    let pair = y * width * 2 + (x / 2) * 4;
+    [
+        src[pair + if x % 2 == 0 { 0 } else { 2 }],
+        src[pair + 1],
+        src[pair + 3],
+    ]
+}
+
 fn configure_source(device: &Device, width: u32, height: u32) -> io::Result<Format> {
     let formats = Capture::enum_formats(device)?;
     let requested = if formats
@@ -747,6 +843,48 @@ mod tests {
         let original = frame.clone();
         beautify_yuyv(&mut frame, 2, 2, 0.0);
         assert_eq!(frame, original);
+    }
+
+    #[test]
+    fn slim_zero_is_identity_and_cheek_moves_inward() {
+        let width = 100u32;
+        let height = 100u32;
+        let mut frame = vec![0u8; (width * height * 2) as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let pair = y * width as usize * 2 + (x / 2) * 4;
+                let slot = if x % 2 == 0 { 0 } else { 2 };
+                frame[pair + slot] = x as u8;
+                frame[pair + 1] = 128;
+                frame[pair + 3] = 128;
+            }
+        }
+        let original = frame.clone();
+        super::slim_yuyv(&mut frame, width, height, 0.0);
+        assert_eq!(frame, original);
+
+        let cx = (width as f32 - 1.0) * 0.5;
+        let cheek_x = (cx + 0.5 * width as f32 * 0.22).round() as usize;
+        let cheek_y = ((height as f32 - 1.0) * 0.46).round() as usize;
+        let nose_x = cx.round() as usize;
+        assert_eq!(
+            super::face_source_x(cx, cheek_y as f32, width as f32, height as f32, 1.0),
+            cx
+        );
+        assert!(
+            super::face_source_x(
+                cheek_x as f32,
+                cheek_y as f32,
+                width as f32,
+                height as f32,
+                1.0
+            ) > cheek_x as f32
+        );
+        super::slim_yuyv(&mut frame, width, height, 1.0);
+        let after = super::yuyv_pixel(&frame, width as usize, cheek_x, cheek_y);
+        assert!(after[0] > cheek_x as u8);
+        let nose = super::yuyv_pixel(&frame, width as usize, nose_x, cheek_y);
+        assert_eq!(nose[0], nose_x as u8);
     }
 
     #[test]
