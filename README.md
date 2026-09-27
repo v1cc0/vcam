@@ -45,8 +45,9 @@ Useful options:
 - `--output /dev/video20`: select the loopback device consumed by OBS
 - `--width 1280 --height 720`: request the camera capture size
 - `--strength 0`: disable smoothing; `1` is the strongest smoothing
+- `--no-preview`: do not start ffplay (useful when viewing only in OBS)
 
-In OBS, add **Video Capture Device** and choose the loopback card labeled `vcam`. Set its resolution/FPS to match the bridge output.
+`ffplay` opens the processed loopback output automatically by default. In OBS, add **Video Capture Device** and choose the loopback card labeled `vcam`. Set its resolution/FPS to match the bridge output.
 
 ## Current scope
 

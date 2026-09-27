@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 
 use jpeg_decoder::{Decoder, PixelFormat};
 use v4l::buffer::Type;
@@ -23,6 +24,7 @@ struct Config {
     width: u32,
     height: u32,
     strength: f32,
+    preview: bool,
 }
 
 fn main() -> io::Result<()> {
@@ -52,6 +54,7 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
         width: DEFAULT_WIDTH,
         height: DEFAULT_HEIGHT,
         strength: DEFAULT_STRENGTH,
+        preview: true,
     };
 
     while let Some(arg) = args.next() {
@@ -71,6 +74,7 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
                             )
                         })?;
             }
+            "--no-preview" => config.preview = false,
             "--help" | "-h" => {
                 print_help();
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "help requested"));
@@ -121,7 +125,7 @@ fn print_help() {
     println!(
         "vcam - Rust beauty camera bridge for OBS\n\n\
          Usage:\n  vcam list\n  vcam run [options]\n\n\
-         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)"
+         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --no-preview        Do not launch ffplay to preview the output"
     );
 }
 
@@ -232,12 +236,20 @@ fn run(config: Config) -> io::Result<()> {
 
     let mut capture = MmapStream::with_buffers(&source, Type::VideoCapture, 4)?;
     let mut output_stream = MmapStream::with_buffers(&output, Type::VideoOutput, 4)?;
+    let mut preview = None;
     let mut frame = Vec::with_capacity((source_format.width * source_format.height * 2) as usize);
 
     loop {
         let (input, metadata) = CaptureStream::next(&mut capture)?;
         let input = &input[..(metadata.bytesused as usize).min(input.len())];
         let (output_buffer, output_metadata) = OutputStream::next(&mut output_stream)?;
+        if config.preview && preview.is_none() && !frame.is_empty() {
+            preview = Some(start_preview(
+                &config.output,
+                output_format.width,
+                output_format.height,
+            )?);
+        }
         let needed = (source_format.width * source_format.height * 2) as usize;
         if output_buffer.len() < needed {
             return Err(io::Error::new(
@@ -278,7 +290,39 @@ fn run(config: Config) -> io::Result<()> {
         output_buffer[..needed].copy_from_slice(&frame);
         output_metadata.bytesused = needed as u32;
         output_metadata.field = 0;
+        if let Some(child) = preview.as_mut() {
+            if let Some(status) = child.try_wait()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("ffplay exited with {status}"),
+                ));
+            }
+        }
     }
+}
+
+fn start_preview(path: &Path, width: u32, height: u32) -> io::Result<Child> {
+    Command::new("ffplay")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-f",
+            "v4l2",
+            "-input_format",
+            "yuyv422",
+            "-video_size",
+            &format!("{width}x{height}"),
+            "-i",
+        ])
+        .arg(path)
+        .spawn()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to start ffplay preview (install ffmpeg): {error}"),
+            )
+        })
 }
 
 fn configure_source(device: &Device, width: u32, height: u32) -> io::Result<Format> {
@@ -377,12 +421,18 @@ fn beautify_yuyv(frame: &mut [u8], width: u32, height: u32, strength: f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{beautify_yuyv, rgb_to_yuv};
+    use super::{beautify_yuyv, parse_config, rgb_to_yuv};
 
     #[test]
     fn rgb_conversion_has_expected_black_and_white_values() {
         assert_eq!(rgb_to_yuv(0, 0, 0), (16, 128, 128));
         assert_eq!(rgb_to_yuv(255, 255, 255), (235, 128, 128));
+    }
+
+    #[test]
+    fn no_preview_option_disables_ffplay() {
+        let config = parse_config(["--no-preview".to_string()].into_iter()).unwrap();
+        assert!(!config.preview);
     }
 
     #[test]
