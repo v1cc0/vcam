@@ -47,7 +47,7 @@ Useful options:
 - `--framerate 30` or `-framerate 30`: request the capture and loopback frame rate
 - `--vf transpose=1` or `-vf transpose=1`: rotate clockwise; `transpose=2` rotates counterclockwise; `hflip` and `vflip` are also supported
 - `--strength 0`: disable smoothing; `1` is the strongest smoothing
-- `--no-preview`: do not start ffplay (useful when viewing only in OBS)
+- `--no-preview`: do not start ffplay (useful when viewing only in OBS). Press `q` in the preview to stop vcam; `--no-preview` keeps the bridge running for OBS
 
 `--vf` transforms the actual loopback frames, so ffplay and OBS show the same result. `ffplay` opens the processed loopback output automatically by default. To compare source and processed output, use three terminals:
 
