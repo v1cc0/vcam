@@ -180,7 +180,7 @@ fn print_help() {
     println!(
         "vcam - Rust beauty camera bridge for OBS\n\n\
          Usage:\n  vcam list\n  vcam run [options]\n\n\
-         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Thin the centered face, 0..1 (default: 0)\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
+         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze frame height. 0 keeps it, 1 halves it (default: 0)\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
     );
 }
 
@@ -263,13 +263,14 @@ fn run(config: Config) -> io::Result<()> {
         &v4l::video::capture::Parameters::with_fps(config.framerate),
     )?;
     let output = Device::with_path(&config.output)?;
+    let squeezed = squeezed_height(source_format.height, config.slim);
     let (output_width, output_height) = if matches!(
         config.rotation,
         Rotation::Clockwise | Rotation::CounterClockwise
     ) {
-        (source_format.height, source_format.width)
+        (squeezed, source_format.width)
     } else {
-        (source_format.width, source_format.height)
+        (source_format.width, squeezed)
     };
     let output_format = Output::set_format(
         &output,
@@ -381,7 +382,7 @@ fn run(config: Config) -> io::Result<()> {
             }
         }
 
-        slim_yuyv(
+        let processed_height = squeeze_yuyv(
             &mut frame,
             source_format.width,
             source_format.height,
@@ -390,13 +391,13 @@ fn run(config: Config) -> io::Result<()> {
         beautify_yuyv(
             &mut frame,
             source_format.width,
-            source_format.height,
+            processed_height,
             config.strength,
         );
         apply_rotation(
             &frame,
             source_format.width,
-            source_format.height,
+            processed_height,
             config.rotation,
             &mut rotated,
             &mut pixels,
@@ -603,17 +604,43 @@ fn apply_rotation(
     }
 }
 
-fn slim_yuyv(frame: &mut [u8], width: u32, height: u32, amount: f32) {
-    if amount == 0.0 {
-        return;
+fn squeezed_height(height: u32, slim: f32) -> u32 {
+    if slim == 0.0 {
+        return height;
     }
-    let src = frame.to_vec();
+    // ponytail: slim 1 halves height (720 -> 360). Nearest even so YUYV stays aligned.
+    let scaled = (height as f32 * (1.0 - 0.5 * slim)).round() as u32;
+    let even = if scaled % 2 == 0 { scaled } else { scaled + 1 };
+    even.clamp(2, height)
+}
+
+fn squeeze_yuyv(frame: &mut Vec<u8>, width: u32, height: u32, slim: f32) -> u32 {
+    let new_height = squeezed_height(height, slim);
+    if new_height == height {
+        return height;
+    }
+    let src = frame.clone();
     let width = width as usize;
-    let height = height as usize;
-    for y in 0..height {
+    let old_height = height as usize;
+    let new_height_us = new_height as usize;
+    frame.clear();
+    frame.resize(width * new_height_us * 2, 0);
+    for y in 0..new_height_us {
+        let sy = y as f32 * (old_height - 1) as f32 / (new_height_us - 1) as f32;
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(old_height - 1);
+        let fy = sy - y0 as f32;
         for x in (0..width).step_by(2) {
-            let left = sample_slim(&src, width, height, x, y, amount);
-            let right = sample_slim(&src, width, height, x + 1, y, amount);
+            let left = lerp_pixel(
+                yuyv_pixel(&src, width, x, y0),
+                yuyv_pixel(&src, width, x, y1),
+                fy,
+            );
+            let right = lerp_pixel(
+                yuyv_pixel(&src, width, x + 1, y0),
+                yuyv_pixel(&src, width, x + 1, y1),
+                fy,
+            );
             let pair = (y * width + x) * 2;
             frame[pair] = left[0];
             frame[pair + 1] = ((left[1] as u16 + right[1] as u16) / 2) as u8;
@@ -621,56 +648,13 @@ fn slim_yuyv(frame: &mut [u8], width: u32, height: u32, amount: f32) {
             frame[pair + 3] = ((left[2] as u16 + right[2] as u16) / 2) as u8;
         }
     }
+    new_height
 }
 
-fn sample_slim(
-    src: &[u8],
-    width: usize,
-    height: usize,
-    x: usize,
-    y: usize,
-    amount: f32,
-) -> [u8; 3] {
-    let sx = face_source_x(x as f32, y as f32, width as f32, height as f32, amount);
-    sample_yuyv(src, width, height, sx, y as f32)
-}
-
-fn face_source_x(x: f32, y: f32, width: f32, height: f32, amount: f32) -> f32 {
-    // ponytail: fixed center ellipse, not a tracked face. Landmarks if the user leaves center.
-    let cx = (width - 1.0) * 0.5;
-    let cy = (height - 1.0) * 0.46;
-    let rx = width * 0.22;
-    let ry = height * 0.34;
-    let dx = x - cx;
-    let dy = y - cy;
-    let ex = dx / rx;
-    let ey = dy / ry;
-    let r2 = ex * ex + ey * ey;
-    if r2 >= 1.0 {
-        return x;
-    }
-    let mask = (1.0 - r2) * ex.abs();
-    cx + dx * (1.0 + amount * mask)
-}
-
-fn sample_yuyv(src: &[u8], width: usize, height: usize, x: f32, y: f32) -> [u8; 3] {
-    let x = x.clamp(0.0, (width - 1) as f32);
-    let y = y.clamp(0.0, (height - 1) as f32);
-    let x0 = x.floor() as usize;
-    let y0 = y.floor() as usize;
-    let x1 = (x0 + 1).min(width - 1);
-    let y1 = (y0 + 1).min(height - 1);
-    let fx = x - x0 as f32;
-    let fy = y - y0 as f32;
-    let p00 = yuyv_pixel(src, width, x0, y0);
-    let p10 = yuyv_pixel(src, width, x1, y0);
-    let p01 = yuyv_pixel(src, width, x0, y1);
-    let p11 = yuyv_pixel(src, width, x1, y1);
+fn lerp_pixel(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     let mut out = [0u8; 3];
     for channel in 0..3 {
-        let top = p00[channel] as f32 * (1.0 - fx) + p10[channel] as f32 * fx;
-        let bottom = p01[channel] as f32 * (1.0 - fx) + p11[channel] as f32 * fx;
-        out[channel] = (top * (1.0 - fy) + bottom * fy).round() as u8;
+        out[channel] = (a[channel] as f32 * (1.0 - t) + b[channel] as f32 * t).round() as u8;
     }
     out
 }
@@ -846,45 +830,23 @@ mod tests {
     }
 
     #[test]
-    fn slim_zero_is_identity_and_cheek_moves_inward() {
-        let width = 100u32;
-        let height = 100u32;
-        let mut frame = vec![0u8; (width * height * 2) as usize];
-        for y in 0..height as usize {
-            for x in 0..width as usize {
-                let pair = y * width as usize * 2 + (x / 2) * 4;
-                let slot = if x % 2 == 0 { 0 } else { 2 };
-                frame[pair + slot] = x as u8;
-                frame[pair + 1] = 128;
-                frame[pair + 3] = 128;
-            }
-        }
-        let original = frame.clone();
-        super::slim_yuyv(&mut frame, width, height, 0.0);
-        assert_eq!(frame, original);
+    fn squeeze_maps_slim_onto_half_height() {
+        assert_eq!(super::squeezed_height(720, 0.0), 720);
+        assert_eq!(super::squeezed_height(720, 1.0), 360);
+        assert_eq!(super::squeezed_height(720, 0.67), 480);
 
-        let cx = (width as f32 - 1.0) * 0.5;
-        let cheek_x = (cx + 0.5 * width as f32 * 0.22).round() as usize;
-        let cheek_y = ((height as f32 - 1.0) * 0.46).round() as usize;
-        let nose_x = cx.round() as usize;
-        assert_eq!(
-            super::face_source_x(cx, cheek_y as f32, width as f32, height as f32, 1.0),
-            cx
-        );
-        assert!(
-            super::face_source_x(
-                cheek_x as f32,
-                cheek_y as f32,
-                width as f32,
-                height as f32,
-                1.0
-            ) > cheek_x as f32
-        );
-        super::slim_yuyv(&mut frame, width, height, 1.0);
-        let after = super::yuyv_pixel(&frame, width as usize, cheek_x, cheek_y);
-        assert!(after[0] > cheek_x as u8);
-        let nose = super::yuyv_pixel(&frame, width as usize, nose_x, cheek_y);
-        assert_eq!(nose[0], nose_x as u8);
+        let mut frame = vec![0u8; 2 * 4 * 2];
+        for y in 0..4usize {
+            frame[y * 4] = (y * 40) as u8;
+            frame[y * 4 + 2] = (y * 40) as u8;
+            frame[y * 4 + 1] = 128;
+            frame[y * 4 + 3] = 128;
+        }
+        let new_height = super::squeeze_yuyv(&mut frame, 2, 4, 1.0);
+        assert_eq!(new_height, 2);
+        assert_eq!(frame.len(), 8);
+        assert_eq!(frame[0], 0);
+        assert_eq!(frame[4], 120);
     }
 
     #[test]
