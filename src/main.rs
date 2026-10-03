@@ -37,6 +37,9 @@ struct Config {
     preset: Preset,
     stats: bool,
     mask: Option<PathBuf>,
+    difference_from: Option<PathBuf>,
+    mask_threshold: u8,
+    mask_softness: u8,
     background: [u8; 3],
     light_wrap: f32,
 }
@@ -62,6 +65,7 @@ fn main() -> io::Result<()> {
     match args.next().as_deref() {
         Some("list") => list_devices(),
         Some("bench") => benchmark(),
+        Some("snapshot") => snapshot(args),
         Some("run") => match parse_config(args) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(()),
             Ok(config) => run(config),
@@ -110,6 +114,104 @@ fn benchmark() -> io::Result<()> {
     Ok(())
 }
 
+fn snapshot(mut args: impl Iterator<Item = String>) -> io::Result<()> {
+    let mut source = None;
+    let mut output = PathBuf::from("background.pgm");
+    let mut width = DEFAULT_WIDTH;
+    let mut height = DEFAULT_HEIGHT;
+    let mut framerate = 30;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--source" => source = Some(PathBuf::from(next_arg("--source", &mut args)?)),
+            "--output" => output = PathBuf::from(next_arg("--output", &mut args)?),
+            "--width" => width = parse_u32("--width", &next_arg("--width", &mut args)?)?,
+            "--height" => height = parse_u32("--height", &next_arg("--height", &mut args)?)?,
+            "--framerate" | "-framerate" => {
+                framerate = parse_u32("--framerate", &next_arg("--framerate", &mut args)?)?;
+            }
+            "--help" | "-h" => {
+                print_help();
+                return Ok(());
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown snapshot option: {arg}"),
+                ));
+            }
+        }
+    }
+    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 || framerate == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot width and height must be positive even integers and framerate must be greater than zero",
+        ));
+    }
+
+    let source_path = select_source(source.as_deref(), Path::new(""))?;
+    let source_device = Device::with_path(&source_path)?;
+    let source_format = configure_source(&source_device, width, height)?;
+    Capture::set_params(
+        &source_device,
+        &v4l::video::capture::Parameters::with_fps(framerate),
+    )?;
+    let mut capture = MmapStream::with_buffers(&source_device, Type::VideoCapture, 4)?;
+    let needed = (source_format.width * source_format.height * 2) as usize;
+    let mut frame = vec![0u8; needed];
+    let mut bad_jpegs = 0;
+
+    loop {
+        let (input, metadata) = CaptureStream::next(&mut capture)?;
+        let input = &input[..(metadata.bytesused as usize).min(input.len())];
+        match source_format.fourcc.str().unwrap_or("") {
+            "MJPG" | "JPEG" => {
+                match jpeg_to_yuyv(input, &mut frame, source_format.width, source_format.height) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                        bad_jpegs += 1;
+                        if bad_jpegs >= 30 {
+                            return Err(error);
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            "YUYV" => {
+                if input.len() < needed {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "camera returned a short YUYV frame",
+                    ));
+                }
+                frame.copy_from_slice(&input[..needed]);
+                break;
+            }
+            format => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("unsupported capture format {format}"),
+                ));
+            }
+        }
+    }
+
+    write_pgm_luma(&output, &frame, source_format.width, source_format.height)?;
+    println!(
+        "snapshot: source={} output={} size={}x{}",
+        source_path.display(),
+        output.display(),
+        source_format.width,
+        source_format.height
+    );
+    Ok(())
+}
+
+fn write_pgm_luma(path: &Path, frame: &[u8], width: u32, height: u32) -> io::Result<()> {
+    let mut output = format!("P5\n{} {}\n255\n", width, height).into_bytes();
+    output.extend(frame.chunks_exact(2).map(|pair| pair[0]));
+    fs::write(path, output)
+}
 fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
     let mut config = Config {
         source: None,
@@ -125,6 +227,9 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
         preset: Preset::Natural,
         stats: false,
         mask: None,
+        difference_from: None,
+        mask_threshold: 18,
+        mask_softness: 32,
         background: [245, 245, 245],
         light_wrap: 0.12,
     };
@@ -155,6 +260,20 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
             "--compare" => config.compare = true,
             "--stats" => config.stats = true,
             "--mask" => config.mask = Some(PathBuf::from(next_arg("--mask", &mut args)?)),
+            "--difference-from" => {
+                config.difference_from =
+                    Some(PathBuf::from(next_arg("--difference-from", &mut args)?));
+            }
+            "--mask-threshold" => {
+                config.mask_threshold = parse_u8(
+                    "--mask-threshold",
+                    &next_arg("--mask-threshold", &mut args)?,
+                )?;
+            }
+            "--mask-softness" => {
+                config.mask_softness =
+                    parse_u8("--mask-softness", &next_arg("--mask-softness", &mut args)?)?;
+            }
             "--background" => {
                 config.background = parse_rgb(&next_arg("--background", &mut args)?)?;
             }
@@ -215,6 +334,12 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
             "strength and slim must be between 0 and 1",
         ));
     }
+    if config.mask.is_some() && config.difference_from.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--mask and --difference-from cannot be used together",
+        ));
+    }
     if config.compare {
         config.preview = true;
     }
@@ -254,6 +379,15 @@ fn parse_u32(name: &str, value: &str) -> io::Result<u32> {
     })
 }
 
+fn parse_u8(name: &str, value: &str) -> io::Result<u8> {
+    value.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be an integer from 0 to 255"),
+        )
+    })
+}
+
 fn parse_rgb(value: &str) -> io::Result<[u8; 3]> {
     let channels = value
         .split(',')
@@ -276,8 +410,9 @@ fn parse_rgb(value: &str) -> io::Result<[u8; 3]> {
 fn print_help() {
     println!(
         "vcam - Rust beauty camera bridge for OBS\n\n\
-         Usage:\n  vcam list\n  vcam bench\n  vcam run [options]\n\n\
-         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze height. 0.33, 0.67, 1 map 720 to 600, 480, 360 (default: 0)\n  --preset NAME       natural or first-take (default: natural)\n  --mask PATH         PGM mask: white keeps the subject, black replaces the background\n  --background R,G,B  Replacement background color (default: 245,245,245)\n  --light-wrap N      Edge light wrap strength, 0..1 (default: 0.12)\n  --stats             Print rolling frame processing timings\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
+         Usage:\n  vcam list\n  vcam bench\n  vcam snapshot [options]\n  vcam run [options]\n\n\
+         Snapshot options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       P5 grayscale clean-plate output (default: background.pgm)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --framerate N       Capture frame rate (default: 30)\n\n\
+         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze height. 0.33, 0.67, 1 map 720 to 600, 480, 360 (default: 0)\n  --preset NAME       natural or first-take (default: natural)\n  --mask PATH         PGM mask: white keeps the subject, black replaces the background\n  --difference-from PATH\n                      P5/P2 clean plate; generate a soft motion mask from frame differences\n  --mask-threshold N Difference needed before a pixel becomes foreground (default: 18)\n  --mask-softness N  Difference ramp width for soft edges (default: 32)\n  --background R,G,B  Replacement background color (default: 245,245,245)\n  --light-wrap N      Edge light wrap strength, 0..1 (default: 0.12)\n  --stats             Print rolling frame processing timings\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
     );
 }
 
@@ -366,6 +501,11 @@ fn run(config: Config) -> io::Result<()> {
         .as_deref()
         .map(|path| load_pgm_mask(path, source_format.width, source_format.height))
         .transpose()?;
+    let difference_reference = config
+        .difference_from
+        .as_deref()
+        .map(|path| load_pgm_mask(path, source_format.width, source_format.height))
+        .transpose()?;
     let background = rgb_to_yuv(
         config.background[0],
         config.background[1],
@@ -431,6 +571,8 @@ fn run(config: Config) -> io::Result<()> {
     let mut pixels = Vec::with_capacity((output_format.width * output_format.height) as usize);
     let mut scratch = Vec::with_capacity((source_format.width * source_format.height * 2) as usize);
     let mut luma = Vec::with_capacity((source_format.width * source_format.height) as usize);
+    let mut difference_mask =
+        Vec::with_capacity((source_format.width * source_format.height) as usize);
     let simd_level = Level::new();
     let mut stats_frames = 0u32;
     let mut stats_work = Duration::ZERO;
@@ -500,7 +642,23 @@ fn run(config: Config) -> io::Result<()> {
         } else {
             None
         };
-        if let Some(mask) = mask.as_deref() {
+        if let Some(reference) = difference_reference.as_deref() {
+            generate_difference_mask(
+                &frame,
+                reference,
+                source_format.width,
+                source_format.height,
+                config.mask_threshold,
+                config.mask_softness,
+                &mut difference_mask,
+            );
+        }
+        let active_mask = if difference_reference.is_some() {
+            Some(difference_mask.as_slice())
+        } else {
+            mask.as_deref()
+        };
+        if let Some(mask) = active_mask {
             composite_mask_yuyv(
                 &mut frame,
                 source_format.width,
@@ -896,6 +1054,34 @@ fn parse_pgm_mask(data: &[u8], width: u32, height: u32) -> io::Result<Vec<u8>> {
     Ok(mask)
 }
 
+fn generate_difference_mask(
+    frame: &[u8],
+    reference: &[u8],
+    width: u32,
+    height: u32,
+    threshold: u8,
+    softness: u8,
+    output: &mut Vec<u8>,
+) {
+    let pixels = width as usize * height as usize;
+    debug_assert_eq!(frame.len(), pixels * 2);
+    debug_assert_eq!(reference.len(), pixels);
+    output.clear();
+    output.reserve(pixels);
+    let threshold = u16::from(threshold);
+    let end = threshold + u16::from(softness);
+    for (pair, background) in frame.chunks_exact(2).zip(reference) {
+        let difference = u16::from(pair[0].abs_diff(*background));
+        let alpha = if difference <= threshold {
+            0
+        } else if softness == 0 || difference >= end {
+            255
+        } else {
+            ((difference - threshold) * 255 / u16::from(softness)) as u8
+        };
+        output.push(alpha);
+    }
+}
 fn pgm_token(data: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
     loop {
         while data.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
@@ -1174,8 +1360,9 @@ fn soften_chroma(value: u8, warmth: i16) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_first_take, apply_rotation, beautify_yuyv, composite_mask_yuyv, parse_config,
-        parse_pgm_mask, parse_video_filter, rgb_to_yuv, Level, Preset, Rotation,
+        apply_first_take, apply_rotation, beautify_yuyv, composite_mask_yuyv,
+        generate_difference_mask, parse_config, parse_pgm_mask, parse_video_filter, rgb_to_yuv,
+        Level, Preset, Rotation,
     };
 
     #[test]
@@ -1205,6 +1392,38 @@ mod tests {
         assert_eq!(frame, [235, 128, 235, 128, 235, 128, 235, 128]);
     }
 
+    #[test]
+    fn difference_mask_has_threshold_and_soft_edge() {
+        let frame = [10, 128, 40, 128, 80, 128, 120, 128];
+        let reference = [10, 0, 64, 120];
+        let mut mask = Vec::new();
+        generate_difference_mask(&frame, &reference, 2, 2, 20, 40, &mut mask);
+        assert_eq!(mask[0], 0);
+        assert!(mask[1] > 0 && mask[1] < 255);
+        assert_eq!(mask[2], 0);
+        assert_eq!(mask[3], 0);
+    }
+
+    #[test]
+    fn difference_options_parse_and_are_mutually_exclusive_with_static_mask() {
+        let config = parse_config(
+            ["--difference-from", "room.pgm", "--mask-threshold", "22"]
+                .map(str::to_string)
+                .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.difference_from,
+            Some(std::path::PathBuf::from("room.pgm"))
+        );
+        assert_eq!(config.mask_threshold, 22);
+        assert!(parse_config(
+            ["--mask", "mask.pgm", "--difference-from", "room.pgm"]
+                .map(str::to_string)
+                .into_iter(),
+        )
+        .is_err());
+    }
     #[test]
     fn rgb_conversion_has_expected_black_and_white_values() {
         assert_eq!(rgb_to_yuv(0, 0, 0), (16, 128, 128));

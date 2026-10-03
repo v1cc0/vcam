@@ -39,6 +39,15 @@ Run the deterministic CPU benchmark without a camera or loopback device:
 cargo run --release -- bench
 ```
 
+Capture a clean-plate grayscale reference while the room is empty and the camera/light setup is unchanged:
+
+```sh
+cargo run --release -- snapshot \
+  --source /dev/video0 \
+  --output background.pgm \
+  --width 1280 --height 720 --framerate 30
+```
+
 Start the bridge. With no `--source`, the first non-loopback physical capture device is selected:
 
 ```sh
@@ -56,7 +65,10 @@ Useful options:
 - `--slim 0.33`: squash the whole frame vertically. From 720: `0.33` is 600, `0.67` is 480, `1` is 360. Width stays 1280
 - `--preset first-take`: apply the CPU SIMD MVP look: lifted blacks, softer contrast, lower chroma, and a subtle warm bias. `natural` is the default
 - `--mask PATH`: load a same-size PGM mask; white keeps the camera subject and black replaces the background
-- `--background R,G,B`: replacement background color when `--mask` is active (default `245,245,245`)
+- `--difference-from PATH`: compare each frame against a same-size PGM clean plate and generate a soft motion mask; use this instead of `--mask`
+- `--mask-threshold N`: luma difference required before a pixel becomes foreground (default `18`)
+- `--mask-softness N`: luma difference ramp used for a soft foreground edge (default `32`)
+- `--background R,G,B`: replacement background color when a mask is active (default `245,245,245`)
 - `--light-wrap N`: feathered edge light wrap strength, `0..1` (default `0.12`)
 - `--stats`: print a rolling 30-frame pipeline timing while running
 - `--compare`: raw camera on the left, processed `/dev/video20` on the right. Press `q` in either window to stop vcam
@@ -80,6 +92,19 @@ cargo run --release -- run --source /dev/video0 --output /dev/video20 \
   --mask mask.pgm --background 245,245,245 --light-wrap 0.12 \
   --compare --stats
 ```
+
+The difference-mask path is useful for a fixed bedroom camera without a model runtime:
+
+```sh
+cargo run --release -- run --source /dev/video0 --output /dev/video20 \
+  --width 1280 --height 720 --preset first-take \
+  --difference-from background.pgm \
+  --mask-threshold 18 --mask-softness 32 \
+  --background 245,245,245 --light-wrap 0.12 \
+  --compare --stats
+```
+
+Use `--difference-from` only when the camera, framing, focus, exposure, and room lighting match the clean-plate capture. It is background subtraction, not semantic person segmentation: monitor changes, shadows, and moving objects can become foreground.
 
 The path is resolved relative to the directory where `vcam` is launched; use an absolute path when the mask lives elsewhere.
 

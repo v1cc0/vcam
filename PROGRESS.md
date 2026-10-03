@@ -2,24 +2,24 @@
 
 ## Current round
 
-- Added the first mask compositing MVP: optional P2/P5 grayscale PGM input through `--mask`.
-- White mask pixels keep the camera subject; black pixels become the configured `--background` color.
-- Added a separable integer 3x3 mask feather and bounded `--light-wrap` edge blending.
-- Added `--background R,G,B` and `--light-wrap 0..1` CLI controls.
-- Generated `mask.pgm`, a 1280x720 soft elliptical fixed-camera mask based on the supplied screenshot for immediate compositing tests; it is intentionally documented as a rough test asset, not person segmentation.
+- Added `vcam snapshot` to capture a same-size P5 grayscale clean plate from the physical camera.
+- Added `--difference-from`, `--mask-threshold`, and `--mask-softness` for fixed-camera background subtraction without an external model runtime.
+- Reused the existing mask feather, background compositing, and Light Wrap path for generated difference masks.
+- Static `--mask` and dynamic `--difference-from` are mutually exclusive to keep the frame path unambiguous.
 
 ## Verification
 
 - `cargo fmt -- --check` passes.
-- `cargo test`: 12 tests passed, including P2/P5 parsing and black-mask replacement.
+- `cargo test`: 14 tests passed, including difference threshold/softness and CLI exclusivity.
 - `cargo build --release` passes.
-- Real-device mask smoke test: `/dev/video0` MJPG 1280x720 -> `/dev/video20` YUYV 1280x720, five 30-frame windows at `21.68-21.79 ms` average pipeline time.
-- The smoke test used a temporary all-black PGM to validate background replacement and cleaned it up after the run.
-- `mask.pgm` was parsed and used in a real-device smoke run at approximately `22.6-23.5 ms/frame`; the run was stopped and no process remains.
+- Real camera `snapshot` produced a valid P5 `1280x720` clean plate at 921,616 bytes.
+- Real-device difference-mask smoke test: `/dev/video0` MJPG 1280x720 -> `/dev/video20` YUYV 1280x720, approximately `23.6-24.6 ms/frame` across four 30-frame windows.
+- The difference smoke test used a same-scene reference for pipeline validation, not a clean-room quality claim.
+- `git diff --check` passes.
 
 ## Next steps
 
-- Produce or connect a real person segmentation mask and inspect hair, glasses, hands, and microphone edges with `--compare`.
-- Tune `--light-wrap` and background brightness from actual night-room footage; keep the default conservative.
-- Add temporal mask smoothing only after frame-to-frame segmentation jitter is observable.
-- Keep ONNX/model inference, Rayon, native OBS FFI, and hot-plug recovery deferred until the mask contract and visual quality are stable.
+- Capture a true empty-room clean plate, then test person silhouette, hair, glasses, hands, and microphone edges.
+- Add temporal mask smoothing if a real clean plate shows frame-to-frame jitter.
+- Consider a model-backed segmentation adapter only if background subtraction cannot meet the visual target.
+- Keep Rayon, native OBS FFI, and hot-plug recovery deferred until mask quality is stable.
