@@ -81,7 +81,7 @@ cargo run --release -- run --source /dev/video0 --output /dev/video20 \
   --compare --stats
 ```
 
-The PGM mask is deliberately an input contract in this MVP. A segmentation model will be added only after this edge/compositing stage is visually validated.
+The path is resolved relative to the directory where `vcam` is launched; use an absolute path when the mask lives elsewhere.
 
 ## Current scope
 

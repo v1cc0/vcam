@@ -831,11 +831,16 @@ fn yuyv_pixel(src: &[u8], width: usize, x: usize, y: usize) -> [u8; 3] {
 }
 
 fn load_pgm_mask(path: &Path, width: u32, height: u32) -> io::Result<Vec<u8>> {
-    let data = fs::read(path)?;
+    let data = fs::read(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot read mask '{}': {error}", path.display()),
+        )
+    })?;
     parse_pgm_mask(&data, width, height).map_err(|error| {
         io::Error::new(
             error.kind(),
-            format!("invalid mask {}: {error}", path.display()),
+            format!("invalid mask '{}': {error}", path.display()),
         )
     })
 }
