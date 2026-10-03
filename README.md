@@ -83,6 +83,10 @@ cargo run --release -- run --source /dev/video0 --output /dev/video20 \
 
 The path is resolved relative to the directory where `vcam` is launched; use an absolute path when the mask lives elsewhere.
 
+The repository also contains `mask.pgm`, a rough `1280x720` fixed-camera soft ellipse generated for the supplied screenshot. It is useful for testing the compositing path immediately, but it is not semantic person segmentation: room pixels inside the ellipse remain visible, and the mask must be replaced when the camera framing changes.
+
+The PGM mask is deliberately an input contract in this MVP. A segmentation model will be added only after this edge/compositing stage is visually validated.
+
 ## Current scope
 
 The MVP supports MJPEG and YUYV USB camera input and publishes YUYV output. The default Rust processing pass smooths luma using a single 3x3 neighborhood filter. The `first-take` preset uses `fearless_simd` runtime dispatch for its luma tone pass and scalar-safe tail handling, then adjusts YUV chroma. The optional mask path accepts P2/P5 PGM, applies a 3x3 feather, composites a configurable background, and adds bounded edge Light Wrap. Face detection, automatic skin segmentation, landmark tracking, makeup overlays, camera hot-plug recovery, and a native OBS UI remain future work.

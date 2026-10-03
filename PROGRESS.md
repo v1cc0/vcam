@@ -6,7 +6,7 @@
 - White mask pixels keep the camera subject; black pixels become the configured `--background` color.
 - Added a separable integer 3x3 mask feather and bounded `--light-wrap` edge blending.
 - Added `--background R,G,B` and `--light-wrap 0..1` CLI controls.
-- Improved missing/invalid mask diagnostics: relative paths are explicitly reported and documented as relative to the launch directory.
+- Generated `mask.pgm`, a 1280x720 soft elliptical fixed-camera mask based on the supplied screenshot for immediate compositing tests; it is intentionally documented as a rough test asset, not person segmentation.
 
 ## Verification
 
@@ -15,7 +15,7 @@
 - `cargo build --release` passes.
 - Real-device mask smoke test: `/dev/video0` MJPG 1280x720 -> `/dev/video20` YUYV 1280x720, five 30-frame windows at `21.68-21.79 ms` average pipeline time.
 - The smoke test used a temporary all-black PGM to validate background replacement and cleaned it up after the run.
-- Missing-mask smoke check now reports `cannot read mask 'mask.pgm': No such file or directory (os error 2)` instead of an ambiguous raw `ENOENT`; `git diff --check` passes.
+- `mask.pgm` was parsed and used in a real-device smoke run at approximately `22.6-23.5 ms/frame`; the run was stopped and no process remains.
 
 ## Next steps
 
