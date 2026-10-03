@@ -6,5 +6,6 @@ description = "A small Rust beauty camera bridge for OBS via v4l2loopback"
 license = "MIT"
 
 [dependencies]
+fearless_simd = "1.0"
 jpeg-decoder = "0.3.2"
 v4l = "0.14.0"

@@ -30,13 +30,19 @@ cargo build --release
 List V4L2 nodes and capabilities:
 
 ```sh
-./target/release/vcam list
+cargo run --release -- list
+```
+
+Run the deterministic CPU benchmark without a camera or loopback device:
+
+```sh
+cargo run --release -- bench
 ```
 
 Start the bridge. With no `--source`, the first non-loopback physical capture device is selected:
 
 ```sh
-./target/release/vcam run --output /dev/video20 --width 1280 --height 720 --strength 0.35
+cargo run --release -- run --output /dev/video20 --width 1280 --height 720 --strength 0.35
 ```
 
 Useful options:
@@ -48,21 +54,23 @@ Useful options:
 - `--vf transpose=1` or `-vf transpose=1`: rotate clockwise; `transpose=2` rotates counterclockwise; `hflip` and `vflip` are also supported
 - `--strength 0`: disable smoothing; `1` is the strongest smoothing
 - `--slim 0.33`: squash the whole frame vertically. From 720: `0.33` is 600, `0.67` is 480, `1` is 360. Width stays 1280
+- `--preset first-take`: apply the CPU SIMD MVP look: lifted blacks, softer contrast, lower chroma, and a subtle warm bias. `natural` is the default
+- `--stats`: print a rolling 30-frame pipeline timing while running
 - `--compare`: raw camera on the left, processed `/dev/video20` on the right. Press `q` in either window to stop vcam
 - `--no-preview`: do not start ffplay (useful when viewing only in OBS). Press `q` in the preview to stop vcam; `--no-preview` keeps the bridge running for OBS
 
 `--vf` transforms the actual loopback frames, so ffplay and OBS show the same result. `ffplay` opens the processed loopback output automatically by default. The USB camera cannot be opened by a second `ffplay` while vcam is capturing, so `--compare` feeds the left window from the frame vcam just decoded:
 
 ```sh
-vcam run --output /dev/video20 --width 1280 --height 720 --framerate 30 \
-  --vf "transpose=1" --strength 0.5 --compare
+cargo run --release -- run --output /dev/video20 --width 1280 --height 720 \
+  --preset first-take --strength 0.25 --compare --stats
 ```
 
-The current `--strength` effect is a small luma blur/noise reduction pass. It is intentionally not face-aware skin retouching, so differences are subtle on a clean camera image. In OBS, add **Video Capture Device** and choose the loopback card labeled `vcam`. Set its resolution/FPS to match the bridge output.
+The current `--strength` effect remains a small luma blur/noise reduction pass. `--preset first-take` adds the first SIMD color pass but is intentionally not face-aware skin retouching or background replacement; it can be compared against the raw camera with `--compare`. In OBS, add **Video Capture Device** and choose the loopback card labeled `vcam`. Set its resolution/FPS to match the bridge output.
 
 ## Current scope
 
-The MVP supports MJPEG and YUYV USB camera input and publishes YUYV output. The current Rust processing pass smooths luma using a single 3x3 neighborhood filter. It is a basic blur/noise reduction effect, not face-aware skin retouching; face detection, skin segmentation, landmark tracking, makeup overlays, camera hot-plug recovery, and a native OBS UI are intentionally deferred until the basic capture/output path is stable.
+The MVP supports MJPEG and YUYV USB camera input and publishes YUYV output. The default Rust processing pass smooths luma using a single 3x3 neighborhood filter. The `first-take` preset uses `fearless_simd` runtime dispatch for its luma tone pass and scalar-safe tail handling, then adjusts YUV chroma. Face detection, skin segmentation, Light Wrap, landmark tracking, makeup overlays, camera hot-plug recovery, and a native OBS UI remain future work.
 
 ## Verification
 
@@ -71,4 +79,4 @@ cargo fmt -- --check
 cargo test
 ```
 
-`cargo test` requires `clang` and a usable system linker. The development host used to bootstrap this project currently lacks `clang` and has a global Cargo linker configuration pointing at an unavailable `mold` binary; use the documented package installation and a working linker before running it.
+`cargo test` requires `clang` and a usable system linker. The current development host has both available; if a fresh Linux setup fails, install the packages listed above and check the active Cargo linker configuration.

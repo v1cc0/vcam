@@ -4,9 +4,11 @@ use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, SyncSender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use fearless_simd::{dispatch, prelude::*, Level};
 use jpeg_decoder::{Decoder, PixelFormat};
+
 use v4l::buffer::Type;
 use v4l::capability::Flags;
 use v4l::format::{Format, FourCC};
@@ -32,6 +34,14 @@ struct Config {
     compare: bool,
     framerate: u32,
     rotation: Rotation,
+    preset: Preset,
+    stats: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Preset {
+    Natural,
+    FirstTake,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +58,7 @@ fn main() -> io::Result<()> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
         Some("list") => list_devices(),
+        Some("bench") => benchmark(),
         Some("run") => match parse_config(args) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(()),
             Ok(config) => run(config),
@@ -64,6 +75,38 @@ fn main() -> io::Result<()> {
     }
 }
 
+fn benchmark() -> io::Result<()> {
+    const WIDTH: usize = 1280;
+    const HEIGHT: usize = 720;
+    const WARMUP: usize = 10;
+    const FRAMES: usize = 120;
+
+    let mut frame = vec![0u8; WIDTH * HEIGHT * 2];
+    for (index, value) in frame.iter_mut().enumerate() {
+        *value = ((index * 37 + 19) % 256) as u8;
+    }
+    let mut luma = Vec::with_capacity(WIDTH * HEIGHT);
+    let level = Level::new();
+    for _ in 0..WARMUP {
+        apply_first_take(&mut frame, &mut luma, level);
+    }
+
+    let started = Instant::now();
+    for _ in 0..FRAMES {
+        apply_first_take(&mut frame, &mut luma, level);
+        std::hint::black_box(&frame);
+    }
+    let average_ms = started.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64;
+    println!(
+        "bench: {}x{} frames={} avg_first_take_ms={average_ms:.3} simd_fallback={}",
+        WIDTH,
+        HEIGHT,
+        FRAMES,
+        level.is_fallback()
+    );
+    Ok(())
+}
+
 fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
     let mut config = Config {
         source: None,
@@ -76,6 +119,8 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
         compare: false,
         framerate: 30,
         rotation: Rotation::None,
+        preset: Preset::Natural,
+        stats: false,
     };
 
     while let Some(arg) = args.next() {
@@ -102,6 +147,19 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
             }
             "--no-preview" => config.preview = false,
             "--compare" => config.compare = true,
+            "--stats" => config.stats = true,
+            "--preset" => {
+                config.preset = match next_arg("--preset", &mut args)?.as_str() {
+                    "natural" => Preset::Natural,
+                    "first-take" => Preset::FirstTake,
+                    value => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("unsupported --preset: {value}"),
+                        ));
+                    }
+                };
+            }
             "--framerate" | "-framerate" => {
                 config.framerate = parse_u32("--framerate", &next_arg("--framerate", &mut args)?)?;
                 if config.framerate == 0 {
@@ -179,8 +237,8 @@ fn parse_u32(name: &str, value: &str) -> io::Result<u32> {
 fn print_help() {
     println!(
         "vcam - Rust beauty camera bridge for OBS\n\n\
-         Usage:\n  vcam list\n  vcam run [options]\n\n\
-         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze height. 0.33, 0.67, 1 map 720 to 600, 480, 360 (default: 0)\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
+         Usage:\n  vcam list\n  vcam bench\n  vcam run [options]\n\n\
+         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze height. 0.33, 0.67, 1 map 720 to 600, 480, 360 (default: 0)\n  --preset NAME       natural or first-take (default: natural)\n  --stats             Print rolling frame processing timings\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
     );
 }
 
@@ -246,14 +304,15 @@ fn select_source(explicit: Option<&Path>, output: &Path) -> io::Result<PathBuf> 
 fn run(config: Config) -> io::Result<()> {
     let source_path = select_source(config.source.as_deref(), &config.output)?;
     println!(
-        "source={} output={} requested={}x{} fps={} strength={:.2} slim={:.2}",
+        "source={} output={} requested={}x{} fps={} strength={:.2} slim={:.2} preset={:?}",
         source_path.display(),
         config.output.display(),
         config.width,
         config.height,
         config.framerate,
         config.strength,
-        config.slim
+        config.slim,
+        config.preset
     );
 
     let source = Device::with_path(&source_path)?;
@@ -321,6 +380,11 @@ fn run(config: Config) -> io::Result<()> {
     let mut frame = Vec::with_capacity((source_format.width * source_format.height * 2) as usize);
     let mut rotated = Vec::with_capacity((output_format.width * output_format.height * 2) as usize);
     let mut pixels = Vec::with_capacity((output_format.width * output_format.height) as usize);
+    let mut scratch = Vec::with_capacity((source_format.width * source_format.height * 2) as usize);
+    let mut luma = Vec::with_capacity((source_format.width * source_format.height) as usize);
+    let simd_level = Level::new();
+    let mut stats_frames = 0u32;
+    let mut stats_work = Duration::ZERO;
     let needed = (source_format.width * source_format.height * 2) as usize;
     let output_bytes = (output_format.width * output_format.height * 2) as usize;
 
@@ -382,18 +446,28 @@ fn run(config: Config) -> io::Result<()> {
             }
         }
 
+        let processing_started = if config.stats {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let processed_height = squeeze_yuyv(
             &mut frame,
             source_format.width,
             source_format.height,
             config.slim,
+            &mut scratch,
         );
         beautify_yuyv(
             &mut frame,
             source_format.width,
             processed_height,
             config.strength,
+            &mut scratch,
         );
+        if config.preset == Preset::FirstTake {
+            apply_first_take(&mut frame, &mut luma, simd_level);
+        }
         apply_rotation(
             &frame,
             source_format.width,
@@ -416,6 +490,19 @@ fn run(config: Config) -> io::Result<()> {
         output_buffer[..output_bytes].copy_from_slice(&rotated);
         output_metadata.bytesused = output_bytes as u32;
         output_metadata.field = 0;
+
+        if let Some(started) = processing_started {
+            stats_frames += 1;
+            stats_work += started.elapsed();
+            if stats_frames == 30 {
+                println!(
+                    "stats: frames=30 pipeline_avg_ms={:.2}",
+                    stats_work.as_secs_f64() * 1000.0 / f64::from(stats_frames)
+                );
+                stats_frames = 0;
+                stats_work = Duration::ZERO;
+            }
+        }
 
         if config.preview && !preview_started {
             preview = Some(start_preview(
@@ -620,12 +707,20 @@ fn squeezed_height(height: u32, slim: f32) -> u32 {
     even.clamp(2, height)
 }
 
-fn squeeze_yuyv(frame: &mut Vec<u8>, width: u32, height: u32, slim: f32) -> u32 {
+fn squeeze_yuyv(
+    frame: &mut Vec<u8>,
+    width: u32,
+    height: u32,
+    slim: f32,
+    scratch: &mut Vec<u8>,
+) -> u32 {
     let new_height = squeezed_height(height, slim);
     if new_height == height {
         return height;
     }
-    let src = frame.clone();
+    scratch.clear();
+    scratch.extend_from_slice(frame);
+    let src = scratch.as_slice();
     let width = width as usize;
     let old_height = height as usize;
     let new_height_us = new_height as usize;
@@ -741,11 +836,12 @@ fn rgb_to_yuv(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     )
 }
 
-fn beautify_yuyv(frame: &mut [u8], width: u32, height: u32, strength: f32) {
+fn beautify_yuyv(frame: &mut [u8], width: u32, height: u32, strength: f32, source: &mut Vec<u8>) {
     if strength == 0.0 {
         return;
     }
-    let source = frame.to_vec();
+    source.clear();
+    source.extend_from_slice(frame);
     let width = width as usize;
     let height = height as usize;
     for y in 0..height {
@@ -768,10 +864,56 @@ fn beautify_yuyv(frame: &mut [u8], width: u32, height: u32, strength: f32) {
     }
 }
 
+fn apply_first_take(frame: &mut [u8], luma: &mut Vec<u8>, level: Level) {
+    luma.clear();
+    luma.reserve(frame.len() / 2);
+    for pair in frame.chunks_exact(2) {
+        luma.push(pair[0]);
+    }
+    dispatch!(level, simd => first_take_luma(simd, luma));
+
+    for (pair, values) in frame.chunks_exact_mut(4).zip(luma.chunks_exact(2)) {
+        pair[0] = values[0];
+        pair[2] = values[1];
+        pair[1] = soften_chroma(pair[1], -2);
+        pair[3] = soften_chroma(pair[3], 2);
+    }
+}
+
+#[inline(always)]
+fn first_take_luma<S: Simd>(simd: S, values: &mut [u8]) {
+    let lanes = S::u8s::LEN;
+    let (vectors, remainder) = values.split_at_mut(values.len() / lanes * lanes);
+    let scale = S::u16s::splat(simd, 7);
+    let lift = S::u16s::splat(simd, 24);
+
+    for chunk in vectors.chunks_exact_mut(lanes) {
+        let input = S::u8s::from_slice(simd, chunk);
+        let (low, high) = input.widen();
+        let low = ((low * scale) >> 3) + lift;
+        let high = ((high * scale) >> 3) + lift;
+        low.saturating_narrow(high).store_slice(chunk);
+    }
+    for value in remainder {
+        *value = first_take_luma_scalar(*value);
+    }
+}
+
+#[inline]
+fn first_take_luma_scalar(value: u8) -> u8 {
+    (24 + u16::from(value) * 7 / 8).min(u16::from(u8::MAX)) as u8
+}
+
+fn soften_chroma(value: u8, warmth: i16) -> u8 {
+    let centered = i16::from(value) - 128;
+    (128 + centered * 7 / 8 + warmth).clamp(0, 255) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_rotation, beautify_yuyv, parse_config, parse_video_filter, rgb_to_yuv, Rotation,
+        apply_first_take, apply_rotation, beautify_yuyv, parse_config, parse_video_filter,
+        rgb_to_yuv, Level, Preset, Rotation,
     };
 
     #[test]
@@ -780,6 +922,36 @@ mod tests {
         assert_eq!(rgb_to_yuv(255, 255, 255), (235, 128, 128));
     }
 
+    #[test]
+    fn first_take_preset_lifts_and_softens_test_frame() {
+        let mut frame = vec![0, 128, 255, 128, 128, 128, 16, 128];
+        let mut luma = Vec::new();
+        apply_first_take(&mut frame, &mut luma, Level::new());
+        assert_eq!(frame, [24, 126, 247, 130, 136, 126, 38, 130]);
+    }
+
+    #[test]
+    fn first_take_options_parse_without_changing_default() {
+        assert_eq!(
+            parse_config(
+                ["--preset", "first-take", "--stats"]
+                    .map(str::to_string)
+                    .into_iter()
+            )
+            .unwrap()
+            .preset,
+            Preset::FirstTake
+        );
+        assert!(
+            parse_config(["--stats"].map(str::to_string).into_iter())
+                .unwrap()
+                .stats
+        );
+        assert_eq!(
+            parse_config(std::iter::empty::<String>()).unwrap().preset,
+            Preset::Natural
+        );
+    }
     #[test]
     fn no_preview_option_disables_ffplay() {
         let config = parse_config(["--no-preview".to_string()].into_iter()).unwrap();
@@ -831,7 +1003,8 @@ mod tests {
     fn strength_zero_leaves_frame_unchanged() {
         let mut frame = vec![10, 20, 100, 30, 200, 40, 40, 50];
         let original = frame.clone();
-        beautify_yuyv(&mut frame, 2, 2, 0.0);
+        let mut scratch = Vec::new();
+        beautify_yuyv(&mut frame, 2, 2, 0.0, &mut scratch);
         assert_eq!(frame, original);
     }
 
@@ -849,7 +1022,8 @@ mod tests {
             frame[y * 4 + 1] = 128;
             frame[y * 4 + 3] = 128;
         }
-        let new_height = super::squeeze_yuyv(&mut frame, 2, 4, 1.0);
+        let mut scratch = Vec::new();
+        let new_height = super::squeeze_yuyv(&mut frame, 2, 4, 1.0, &mut scratch);
         assert_eq!(new_height, 2);
         assert_eq!(frame.len(), 8);
         assert_eq!(frame[0], 0);
