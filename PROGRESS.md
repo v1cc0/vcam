@@ -2,21 +2,21 @@
 
 ## Current round
 
-- Fixed normal ffplay exit handling so closing the preview does not report a `BrokenPipe` error or restart ffplay.
-- Documented the actual processing scope: one 3x3 luma smoothing pass, plus the existing frame rotation/flip path.
-- Added a three-terminal raw-versus-loopback comparison command.
-- Added a Rust `vcam` binary for Linux V4L2 capture and `v4l2loopback` output.
-- Added automatic selection of the first physical non-loopback capture device.
-- Added MJPEG and YUYV input handling, RGB-to-YUYV conversion, and a configurable luma smoothing pass.
-- Added `list` and `run` CLI commands plus focused unit tests.
-- Added README with Arch Linux setup and OBS configuration.
+- Read the pasted Gemini conversation and documented the implementation plan in `PLAN.md`.
+- Scope is now explicit: reproduce a low-cost, high-key, clean and translucent THE FIRST TAKE-style look for a nighttime bedroom Vibe Coding stream, while keeping the existing V4L2 bridge as the first OBS integration.
+- `fearless_simd` 1.0.0 is available for Rust 1.89+ and is not yet added to this repository. The plan requires an API spike and scalar oracle before production kernels.
+- The first engineering milestone is measurement and reusable scratch buffers; ONNX/model inference, Rayon, and native OBS FFI are intentionally deferred.
+- Existing `--slim` steps on a 720-tall capture: `0.33` -> 600, `0.67` -> 480, `1` -> 360. Width stays 1280.
+- With `transpose=1` the loopback is 600x1280, 480x1280, or 360x1280.
 
 ## Verification
 
-- `cargo fmt -- --check`, `git diff --check`, `cargo test` (5 tests), and `cargo build --release` passed.
+- `cargo fmt -- --check`, `git diff --check`, and `cargo test` (8 tests) pass in this documentation round.
+- The pasted chat content was used as the source for the new plan; the earlier external Gemini share page did not expose its conversation body over HTTP.
 
 ## Next steps
 
-- Verify the three-terminal raw-versus-processed comparison on the user's desktop.
-- A face-aware skin retouching algorithm remains future work; current strength values only control luma blur.
-- Add hot-plug recovery and persistent camera selection after the single-camera path is validated.
+- M0: add optional stage timing and a deterministic synthetic-frame benchmark.
+- M1: remove steady-state per-frame copies/allocations while preserving the scalar path and CLI behavior.
+- M2: add the `fearless_simd` spike, dispatch, scalar fallback, and differential tests.
+- Keep `PROGRESS.md`, `PROGRESS.md.lastround`, and `INCIDENTS.md` local; `PLAN.md` is the project-facing plan.
