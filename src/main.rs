@@ -36,6 +36,9 @@ struct Config {
     rotation: Rotation,
     preset: Preset,
     stats: bool,
+    mask: Option<PathBuf>,
+    background: [u8; 3],
+    light_wrap: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +124,9 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
         rotation: Rotation::None,
         preset: Preset::Natural,
         stats: false,
+        mask: None,
+        background: [245, 245, 245],
+        light_wrap: 0.12,
     };
 
     while let Some(arg) = args.next() {
@@ -148,6 +154,17 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
             "--no-preview" => config.preview = false,
             "--compare" => config.compare = true,
             "--stats" => config.stats = true,
+            "--mask" => config.mask = Some(PathBuf::from(next_arg("--mask", &mut args)?)),
+            "--background" => {
+                config.background = parse_rgb(&next_arg("--background", &mut args)?)?;
+            }
+            "--light-wrap" => {
+                config.light_wrap = next_arg("--light-wrap", &mut args)?
+                    .parse::<f32>()
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "--light-wrap must be a number")
+                    })?;
+            }
             "--preset" => {
                 config.preset = match next_arg("--preset", &mut args)?.as_str() {
                     "natural" => Preset::Natural,
@@ -189,7 +206,10 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
             "width and height must be positive even integers",
         ));
     }
-    if !(0.0..=1.0).contains(&config.strength) || !(0.0..=1.0).contains(&config.slim) {
+    if !(0.0..=1.0).contains(&config.strength)
+        || !(0.0..=1.0).contains(&config.slim)
+        || !(0.0..=1.0).contains(&config.light_wrap)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "strength and slim must be between 0 and 1",
@@ -234,11 +254,30 @@ fn parse_u32(name: &str, value: &str) -> io::Result<u32> {
     })
 }
 
+fn parse_rgb(value: &str) -> io::Result<[u8; 3]> {
+    let channels = value
+        .split(',')
+        .map(|channel| channel.trim().parse::<u8>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--background must be R,G,B with channels from 0 to 255",
+            )
+        })?;
+    channels.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--background must contain exactly three channels",
+        )
+    })
+}
+
 fn print_help() {
     println!(
         "vcam - Rust beauty camera bridge for OBS\n\n\
          Usage:\n  vcam list\n  vcam bench\n  vcam run [options]\n\n\
-         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze height. 0.33, 0.67, 1 map 720 to 600, 480, 360 (default: 0)\n  --preset NAME       natural or first-take (default: natural)\n  --stats             Print rolling frame processing timings\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
+         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze height. 0.33, 0.67, 1 map 720 to 600, 480, 360 (default: 0)\n  --preset NAME       natural or first-take (default: natural)\n  --mask PATH         PGM mask: white keeps the subject, black replaces the background\n  --background R,G,B  Replacement background color (default: 245,245,245)\n  --light-wrap N      Edge light wrap strength, 0..1 (default: 0.12)\n  --stats             Print rolling frame processing timings\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
     );
 }
 
@@ -322,6 +361,16 @@ fn run(config: Config) -> io::Result<()> {
         &v4l::video::capture::Parameters::with_fps(config.framerate),
     )?;
     let output = Device::with_path(&config.output)?;
+    let mask = config
+        .mask
+        .as_deref()
+        .map(|path| load_pgm_mask(path, source_format.width, source_format.height))
+        .transpose()?;
+    let background = rgb_to_yuv(
+        config.background[0],
+        config.background[1],
+        config.background[2],
+    );
     let squeezed = squeezed_height(source_format.height, config.slim);
     let (output_width, output_height) = if matches!(
         config.rotation,
@@ -451,6 +500,18 @@ fn run(config: Config) -> io::Result<()> {
         } else {
             None
         };
+        if let Some(mask) = mask.as_deref() {
+            composite_mask_yuyv(
+                &mut frame,
+                source_format.width,
+                source_format.height,
+                mask,
+                background,
+                config.light_wrap,
+                &mut scratch,
+                &mut luma,
+            );
+        }
         let processed_height = squeeze_yuyv(
             &mut frame,
             source_format.width,
@@ -769,6 +830,202 @@ fn yuyv_pixel(src: &[u8], width: usize, x: usize, y: usize) -> [u8; 3] {
     ]
 }
 
+fn load_pgm_mask(path: &Path, width: u32, height: u32) -> io::Result<Vec<u8>> {
+    let data = fs::read(path)?;
+    parse_pgm_mask(&data, width, height).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("invalid mask {}: {error}", path.display()),
+        )
+    })
+}
+
+fn parse_pgm_mask(data: &[u8], width: u32, height: u32) -> io::Result<Vec<u8>> {
+    let mut cursor = 0;
+    let magic = pgm_token(data, &mut cursor).ok_or_else(|| invalid_mask("missing PGM magic"))?;
+    let expected_magic = if magic == b"P5" {
+        5
+    } else if magic == b"P2" {
+        2
+    } else {
+        return Err(invalid_mask("only P2 and P5 PGM masks are supported"));
+    };
+    let parsed_width = parse_pgm_usize(&pgm_token(data, &mut cursor), "width")?;
+    let parsed_height = parse_pgm_usize(&pgm_token(data, &mut cursor), "height")?;
+    let max_value = parse_pgm_usize(&pgm_token(data, &mut cursor), "maximum value")?;
+    let expected_len = width as usize * height as usize;
+    if parsed_width != width as usize || parsed_height != height as usize || max_value == 0 {
+        return Err(invalid_mask(
+            "PGM dimensions or maximum value do not match the video",
+        ));
+    }
+
+    let mut mask = Vec::with_capacity(expected_len);
+    if expected_magic == 5 {
+        if max_value > 255 {
+            return Err(invalid_mask("P5 maximum value must be at most 255"));
+        }
+        if data.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+            if data.get(cursor.wrapping_sub(1)) == Some(&b'\r') && data.get(cursor) == Some(&b'\n')
+            {
+                cursor += 1;
+            }
+        }
+        let payload = data.get(cursor..).unwrap_or_default();
+        if payload.len() < expected_len {
+            return Err(invalid_mask("P5 payload is shorter than the video frame"));
+        }
+        mask.extend_from_slice(&payload[..expected_len]);
+    } else {
+        for _ in 0..expected_len {
+            let token = pgm_token(data, &mut cursor)
+                .ok_or_else(|| invalid_mask("P2 payload is shorter than the video frame"))?;
+            let value = parse_pgm_usize(&Some(token), "pixel")?;
+            if value > max_value {
+                return Err(invalid_mask("P2 pixel exceeds the maximum value"));
+            }
+            mask.push((value * 255 / max_value) as u8);
+        }
+    }
+    Ok(mask)
+}
+
+fn pgm_token(data: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
+    loop {
+        while data.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+            *cursor += 1;
+        }
+        if data.get(*cursor) != Some(&b'#') {
+            break;
+        }
+        while let Some(byte) = data.get(*cursor) {
+            *cursor += 1;
+            if *byte == b'\n' {
+                break;
+            }
+        }
+    }
+    let start = *cursor;
+    while let Some(byte) = data.get(*cursor) {
+        if byte.is_ascii_whitespace() {
+            break;
+        }
+        *cursor += 1;
+    }
+    (start != *cursor).then(|| data[start..*cursor].to_vec())
+}
+
+fn parse_pgm_usize(token: &Option<Vec<u8>>, name: &str) -> io::Result<usize> {
+    let token = token
+        .as_deref()
+        .ok_or_else(|| invalid_mask(&format!("missing PGM {name}")))?;
+    std::str::from_utf8(token)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| invalid_mask(&format!("invalid PGM {name}")))
+}
+
+fn invalid_mask(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn composite_mask_yuyv(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    mask: &[u8],
+    background: (u8, u8, u8),
+    light_wrap: f32,
+    scratch: &mut Vec<u8>,
+    mask_scratch: &mut Vec<u8>,
+) {
+    let width = width as usize;
+    let height = height as usize;
+    debug_assert_eq!(mask.len(), width * height);
+    scratch.clear();
+    scratch.extend_from_slice(frame);
+    mask_scratch.clear();
+    mask_scratch.resize(width * height, 0);
+    let (background_y, background_u, background_v) = background;
+
+    // Separable integer blur: six mask reads per pixel instead of rebuilding a 3x3
+    // neighborhood for every output pixel.
+    for y in 0..height {
+        for x in 0..width {
+            let left = x.saturating_sub(1);
+            let right = (x + 1).min(width - 1);
+            mask_scratch[y * width + x] = ((u16::from(mask[y * width + left])
+                + u16::from(mask[y * width + x])
+                + u16::from(mask[y * width + right]))
+                / 3) as u8;
+        }
+    }
+
+    for y in 0..height {
+        for x in (0..width).step_by(2) {
+            let left = mask_alpha(mask, mask_scratch, width, height, x, y);
+            let right = mask_alpha(mask, mask_scratch, width, height, x + 1, y);
+            let left_y =
+                composite_luma(scratch[(y * width + x) * 2], background_y, left, light_wrap);
+            let right_y = composite_luma(
+                scratch[(y * width + x + 1) * 2],
+                background_y,
+                right,
+                light_wrap,
+            );
+            let pair = (y * width + x) * 2;
+            frame[pair] = left_y;
+            frame[pair + 2] = right_y;
+            let alpha = (left.alpha + right.alpha) * 0.5;
+            frame[pair + 1] = blend_u8(scratch[pair + 1], background_u, 1.0 - alpha);
+            frame[pair + 3] = blend_u8(scratch[pair + 3], background_v, 1.0 - alpha);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MaskSample {
+    alpha: f32,
+    center: f32,
+}
+
+fn mask_alpha(
+    mask: &[u8],
+    horizontal: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+) -> MaskSample {
+    let x = x.min(width - 1);
+    let center = f32::from(mask[y * width + x]) / 255.0;
+    let top = y.saturating_sub(1) * width + x;
+    let middle = y * width + x;
+    let bottom = (y + 1).min(height - 1) * width + x;
+    let blurred = (u16::from(horizontal[top])
+        + u16::from(horizontal[middle])
+        + u16::from(horizontal[bottom]))
+        / 3;
+    MaskSample {
+        alpha: f32::from(blurred) / 255.0,
+        center,
+    }
+}
+
+fn composite_luma(value: u8, background: u8, sample: MaskSample, light_wrap: f32) -> u8 {
+    let base = blend_u8(value, background, 1.0 - sample.alpha);
+    let edge =
+        (4.0 * sample.alpha * (1.0 - sample.alpha) * sample.center * light_wrap).clamp(0.0, 1.0);
+    blend_u8(base, background, edge)
+}
+
+fn blend_u8(foreground: u8, background: u8, background_weight: f32) -> u8 {
+    (f32::from(foreground) * (1.0 - background_weight) + f32::from(background) * background_weight)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
 fn configure_source(device: &Device, width: u32, height: u32) -> io::Result<Format> {
     let formats = Capture::enum_formats(device)?;
     let requested = if formats
@@ -912,9 +1169,36 @@ fn soften_chroma(value: u8, warmth: i16) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_first_take, apply_rotation, beautify_yuyv, parse_config, parse_video_filter,
-        rgb_to_yuv, Level, Preset, Rotation,
+        apply_first_take, apply_rotation, beautify_yuyv, composite_mask_yuyv, parse_config,
+        parse_pgm_mask, parse_video_filter, rgb_to_yuv, Level, Preset, Rotation,
     };
+
+    #[test]
+    fn pgm_masks_parse_ascii_and_binary_payloads() {
+        let ascii = b"P2\n# subject mask\n2 2\n255\n0 255 255 0\n";
+        assert_eq!(parse_pgm_mask(ascii, 2, 2).unwrap(), [0, 255, 255, 0]);
+
+        let binary = b"P5\n2 2\n255\n\x00\xff\xff\x00";
+        assert_eq!(parse_pgm_mask(binary, 2, 2).unwrap(), [0, 255, 255, 0]);
+    }
+
+    #[test]
+    fn black_mask_replaces_frame_with_background() {
+        let mut frame = vec![40, 100, 80, 120, 60, 140, 100, 160];
+        let mut scratch = Vec::new();
+        let mut mask_scratch = Vec::new();
+        composite_mask_yuyv(
+            &mut frame,
+            2,
+            2,
+            &[0, 0, 0, 0],
+            (235, 128, 128),
+            0.12,
+            &mut scratch,
+            &mut mask_scratch,
+        );
+        assert_eq!(frame, [235, 128, 235, 128, 235, 128, 235, 128]);
+    }
 
     #[test]
     fn rgb_conversion_has_expected_black_and_white_values() {
