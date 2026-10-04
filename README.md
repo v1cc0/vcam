@@ -65,10 +65,10 @@ Useful options:
 - `--slim 0.33`: squash the whole frame vertically. From 720: `0.33` is 600, `0.67` is 480, `1` is 360. Width stays 1280
 - `--preset first-take`: apply the CPU SIMD MVP look: lifted blacks, softer contrast, lower chroma, and a subtle warm bias. `natural` is the default
 - `--mask PATH`: load a same-size PGM mask; white keeps the camera subject and black replaces the background
-- `--difference-from PATH`: compare each frame against a same-size PGM clean plate and generate a soft motion mask; use this instead of `--mask`
+- `--dump-mask PATH`: save the first runtime difference mask as a PGM for diagnosis
 - `--mask-threshold N`: luma difference required before a pixel becomes foreground (default `28`)
 - `--mask-softness N`: luma difference ramp used for a soft foreground edge (default `32`)
-- `--background R,G,B`: replacement background color when a mask is active (default `245,245,245`)
+- `--background R,G,B`: replacement background color when a mask is active (default `232,232,232`)
 - `--light-wrap N`: feathered edge light wrap strength, `0..1` (default `0.12`)
 - `--stats`: print a rolling 30-frame pipeline timing while running
 - `--compare`: raw camera on the left, processed `/dev/video20` on the right. Press `q` in either window to stop vcam
@@ -81,7 +81,7 @@ cargo run --release -- run --output /dev/video20 --width 1280 --height 720 \
   --preset first-take --strength 0.25 --compare --stats
 ```
 
-The current `--strength` effect remains a small luma blur/noise reduction pass. `--preset first-take` adds the first SIMD color pass. `--mask` adds the first background-compositing path with mask feathering and Light Wrap, but it is intentionally not a segmentation model or face-aware skin retouching system. In OBS, add **Video Capture Device** and choose the loopback card labeled `vcam`. Set its resolution/FPS to match the bridge output.
+The first-take luma pass is deliberately conservative: it compresses the upper range and applies only a small shadow lift. This keeps the high-key background without turning the face, hair, and shirt into clipped white. `--mask` adds the first background-compositing path with mask feathering and Light Wrap, but it is intentionally not a segmentation model or face-aware skin retouching system. In OBS, add **Video Capture Device** and choose the loopback card labeled `vcam`. Set its resolution/FPS to match the bridge output.
 
 For the mask path, create a grayscale PGM at the capture resolution. White (`255`) keeps the subject; black (`0`) becomes the background; gray values provide transparency. The mask is softened with a 3x3 neighborhood before compositing:
 
@@ -89,7 +89,7 @@ For the mask path, create a grayscale PGM at the capture resolution. White (`255
 # Example invocation after producing mask.pgm with a segmentation tool
 cargo run --release -- run --source /dev/video0 --output /dev/video20 \
   --width 1280 --height 720 --preset first-take \
-  --mask mask.pgm --background 245,245,245 --light-wrap 0.12 \
+  --mask mask.pgm --background 232,232,232 --light-wrap 0.12 \
   --compare --stats
 ```
 
@@ -99,12 +99,13 @@ The difference-mask path is useful for a fixed bedroom camera without a model ru
 cargo run --release -- run --source /dev/video0 --output /dev/video20 \
   --width 1280 --height 720 --preset first-take \
   --difference-from background.pgm \
+  --dump-mask /tmp/vcam-mask.pgm \
   --mask-threshold 28 --mask-softness 32 \
-  --background 245,245,245 --light-wrap 0.12 \
+  --background 232,232,232 --light-wrap 0.12 \
   --compare --stats
 ```
 
-Use `--difference-from` only when the camera, framing, focus, exposure, and room lighting match the clean-plate capture. Capture the clean plate while nobody is in frame; the command averages 30 frames by default to suppress JPEG noise. It is background subtraction, not semantic person segmentation: monitor changes, shadows, and moving objects can become foreground.
+The difference mask first removes the frame-wide median luma shift, which prevents a small auto-exposure change from turning the entire room into foreground. It still requires a genuinely empty clean plate; if the plate contains the person, the algorithm cannot recover the missing subject pixels.
 
 The path is resolved relative to the directory where `vcam` is launched; use an absolute path when the mask lives elsewhere.
 

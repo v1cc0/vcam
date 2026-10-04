@@ -38,6 +38,7 @@ struct Config {
     stats: bool,
     mask: Option<PathBuf>,
     difference_from: Option<PathBuf>,
+    dump_mask: Option<PathBuf>,
     mask_threshold: u8,
     mask_softness: u8,
     background: [u8; 3],
@@ -267,9 +268,10 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
         stats: false,
         mask: None,
         difference_from: None,
-        mask_threshold: 18,
+        dump_mask: None,
+        mask_threshold: 28,
         mask_softness: 32,
-        background: [245, 245, 245],
+        background: [232, 232, 232],
         light_wrap: 0.12,
     };
 
@@ -302,6 +304,9 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
             "--difference-from" => {
                 config.difference_from =
                     Some(PathBuf::from(next_arg("--difference-from", &mut args)?));
+            }
+            "--dump-mask" => {
+                config.dump_mask = Some(PathBuf::from(next_arg("--dump-mask", &mut args)?));
             }
             "--mask-threshold" => {
                 config.mask_threshold = parse_u8(
@@ -379,6 +384,12 @@ fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
             "--mask and --difference-from cannot be used together",
         ));
     }
+    if config.dump_mask.is_some() && config.difference_from.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--dump-mask requires --difference-from",
+        ));
+    }
     if config.compare {
         config.preview = true;
     }
@@ -451,7 +462,7 @@ fn print_help() {
         "vcam - Rust beauty camera bridge for OBS\n\n\
          Usage:\n  vcam list\n  vcam bench\n  vcam snapshot [options]\n  vcam run [options]\n\n\
          Snapshot options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       P5 grayscale clean-plate output (default: background.pgm)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --framerate N       Capture frame rate (default: 30)\n  --frames N          Average this many clean frames (default: 30)\n\n\
-         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze height. 0.33, 0.67, 1 map 720 to 600, 480, 360 (default: 0)\n  --preset NAME       natural or first-take (default: natural)\n  --mask PATH         PGM mask: white keeps the subject, black replaces the background\n  --difference-from PATH\n                      P5/P2 clean plate; generate a soft motion mask from frame differences\n  --mask-threshold N Difference needed before a pixel becomes foreground (default: 28)\n  --mask-softness N  Difference ramp width for soft edges (default: 32)\n  --background R,G,B  Replacement background color (default: 245,245,245)\n  --light-wrap N      Edge light wrap strength, 0..1 (default: 0.12)\n  --stats             Print rolling frame processing timings\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
+         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze height. 0.33, 0.67, 1 map 720 to 600, 480, 360 (default: 0)\n  --preset NAME       natural or first-take (default: natural)\n  --mask PATH         PGM mask: white keeps the subject, black replaces the background\n  --difference-from PATH\n                      P5/P2 clean plate; generate a soft motion mask from frame differences\n  --dump-mask PATH    Save the first generated difference mask as a PGM\n  --mask-threshold N Difference needed before a pixel becomes foreground (default: 28)\n  --mask-softness N  Difference ramp width for soft edges (default: 32)\n  --background R,G,B  Replacement background color (default: 232,232,232)\n  --light-wrap N      Edge light wrap strength, 0..1 (default: 0.12)\n  --stats             Print rolling frame processing timings\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
     );
 }
 
@@ -614,6 +625,7 @@ fn run(config: Config) -> io::Result<()> {
         Vec::with_capacity((source_format.width * source_format.height) as usize);
     let simd_level = Level::new();
     let mut stats_frames = 0u32;
+    let mut mask_dumped = false;
     let mut stats_work = Duration::ZERO;
     let needed = (source_format.width * source_format.height * 2) as usize;
     let output_bytes = (output_format.width * output_format.height * 2) as usize;
@@ -691,6 +703,18 @@ fn run(config: Config) -> io::Result<()> {
                 config.mask_softness,
                 &mut difference_mask,
             );
+            if !mask_dumped {
+                if let Some(path) = config.dump_mask.as_deref() {
+                    write_pgm_luma(
+                        path,
+                        &difference_mask,
+                        source_format.width,
+                        source_format.height,
+                    )?;
+                    eprintln!("wrote difference mask {}", path.display());
+                }
+                mask_dumped = true;
+            }
         }
         let active_mask = if difference_reference.is_some() {
             Some(difference_mask.as_slice())
@@ -1107,10 +1131,25 @@ fn generate_difference_mask(
     debug_assert_eq!(reference.len(), pixels);
     output.clear();
     output.reserve(pixels);
+    let mut histogram = [0u32; 511];
+    for (pair, background) in frame.chunks_exact(2).zip(reference) {
+        let difference = i16::from(pair[0]) - i16::from(*background) + 255;
+        histogram[difference as usize] += 1;
+    }
+    let midpoint = (pixels as u32).div_ceil(2);
+    let mut seen = 0;
+    let offset = histogram
+        .iter()
+        .position(|count| {
+            seen += count;
+            seen >= midpoint
+        })
+        .unwrap_or(255) as i16
+        - 255;
     let threshold = u16::from(threshold);
     let end = threshold + u16::from(softness);
     for (pair, background) in frame.chunks_exact(2).zip(reference) {
-        let difference = u16::from(pair[0].abs_diff(*background));
+        let difference = (i16::from(pair[0]) - i16::from(*background) - offset).unsigned_abs();
         let alpha = if difference <= threshold {
             0
         } else if softness == 0 || difference >= end {
@@ -1372,7 +1411,7 @@ fn first_take_luma<S: Simd>(simd: S, values: &mut [u8]) {
     let lanes = S::u8s::LEN;
     let (vectors, remainder) = values.split_at_mut(values.len() / lanes * lanes);
     let scale = S::u16s::splat(simd, 7);
-    let lift = S::u16s::splat(simd, 24);
+    let lift = S::u16s::splat(simd, 10);
 
     for chunk in vectors.chunks_exact_mut(lanes) {
         let input = S::u8s::from_slice(simd, chunk);
@@ -1388,7 +1427,7 @@ fn first_take_luma<S: Simd>(simd: S, values: &mut [u8]) {
 
 #[inline]
 fn first_take_luma_scalar(value: u8) -> u8 {
-    (24 + u16::from(value) * 7 / 8).min(u16::from(u8::MAX)) as u8
+    (10 + u16::from(value) * 7 / 8).min(u16::from(u8::MAX)) as u8
 }
 
 fn soften_chroma(value: u8, warmth: i16) -> u8 {
@@ -1451,6 +1490,19 @@ mod tests {
     }
 
     #[test]
+    fn dump_mask_requires_difference_reference() {
+        assert!(parse_config(["--dump-mask", "mask.pgm"].map(str::to_string).into_iter()).is_err());
+    }
+
+    #[test]
+    fn difference_mask_ignores_uniform_exposure_shift() {
+        let frame = [30, 128, 40, 128, 50, 128, 60, 128];
+        let reference = [20, 30, 40, 50];
+        let mut mask = Vec::new();
+        generate_difference_mask(&frame, &reference, 2, 2, 5, 10, &mut mask);
+        assert_eq!(mask, [0, 0, 0, 0]);
+    }
+    #[test]
     fn difference_options_parse_and_are_mutually_exclusive_with_static_mask() {
         let config = parse_config(
             ["--difference-from", "room.pgm", "--mask-threshold", "22"]
@@ -1481,7 +1533,7 @@ mod tests {
         let mut frame = vec![0, 128, 255, 128, 128, 128, 16, 128];
         let mut luma = Vec::new();
         apply_first_take(&mut frame, &mut luma, Level::new());
-        assert_eq!(frame, [24, 126, 247, 130, 136, 126, 38, 130]);
+        assert_eq!(frame, [10, 126, 233, 130, 122, 126, 24, 130]);
     }
 
     #[test]

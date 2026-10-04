@@ -2,23 +2,24 @@
 
 ## Current round
 
-- Diagnosed the screenshot's noisy/ghosted background: a one-frame clean plate plus low threshold treated JPEG noise and lighting drift as foreground.
-- Changed `vcam snapshot` to average 30 clean frames by default; added `--frames N` for control.
-- Raised the default `--mask-threshold` from 18 to 28 while keeping `--mask-softness 32`.
-- Added an accumulation unit test for averaged YUYV luma.
+- Reduced `first-take` luma lift from 24 to 10; the SIMD and scalar paths now preserve more facial, hair, and shirt detail.
+- Added `--dump-mask PATH` to save the first generated difference mask for diagnosis.
+- Added frame-wide median luma-shift compensation before difference thresholding, reducing false foreground from auto-exposure drift.
+- Reduced the default replacement background from YUV-equivalent RGB `245,245,245` to `232,232,232` to keep high-key whites from clipping.
+- Confirmed from the exported mask and grayscale `background.pgm` that the current local plate still contains the person; this cannot be repaired by threshold or tone settings.
 
 ## Verification
 
 - `cargo fmt -- --check` passes.
-- `cargo test`: 15 tests passed.
+- `cargo test`: 17 tests passed.
 - `cargo build --release` passes.
-- `snapshot --frames 3` produced a valid P5 `1280x720` file of 921,616 bytes.
-- The previous screenshot's ghost background remains expected when `background.pgm` was captured with the subject in frame; regenerate it from an empty room.
+- Difference smoke test with `--preset natural --light-wrap 0` ran at approximately `20.85-21.33 ms/frame` and wrote a valid `1280x720` P5 mask.
+- Added a regression test proving a uniform exposure shift does not create a difference mask.
 - `git diff --check` passes.
 
 ## Next steps
 
-- Regenerate `background.pgm` with the room empty, fixed exposure/focus, and unchanged lighting.
-- Run the difference path with defaults first; tune threshold only after inspecting a clean-room result.
-- Add temporal mask smoothing if a valid clean plate still flickers around hair, glasses, hands, or the microphone.
-- Consider a model-backed segmentation adapter only if background subtraction cannot meet the visual target.
+- Re-capture `background.pgm` while fully out of frame, with fixed exposure/focus and unchanged lighting.
+- Inspect `--dump-mask` before judging final compositing.
+- Run `--preset natural --light-wrap 0` first, then enable `first-take` and Light Wrap separately.
+- Add temporal mask smoothing only after a valid clean plate still flickers around hair, glasses, hands, or the microphone.
