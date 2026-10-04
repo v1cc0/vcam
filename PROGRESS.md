@@ -2,24 +2,23 @@
 
 ## Current round
 
-- Added `vcam snapshot` to capture a same-size P5 grayscale clean plate from the physical camera.
-- Added `--difference-from`, `--mask-threshold`, and `--mask-softness` for fixed-camera background subtraction without an external model runtime.
-- Reused the existing mask feather, background compositing, and Light Wrap path for generated difference masks.
-- Static `--mask` and dynamic `--difference-from` are mutually exclusive to keep the frame path unambiguous.
+- Diagnosed the screenshot's noisy/ghosted background: a one-frame clean plate plus low threshold treated JPEG noise and lighting drift as foreground.
+- Changed `vcam snapshot` to average 30 clean frames by default; added `--frames N` for control.
+- Raised the default `--mask-threshold` from 18 to 28 while keeping `--mask-softness 32`.
+- Added an accumulation unit test for averaged YUYV luma.
 
 ## Verification
 
 - `cargo fmt -- --check` passes.
-- `cargo test`: 14 tests passed, including difference threshold/softness and CLI exclusivity.
+- `cargo test`: 15 tests passed.
 - `cargo build --release` passes.
-- Real camera `snapshot` produced a valid P5 `1280x720` clean plate at 921,616 bytes.
-- Real-device difference-mask smoke test: `/dev/video0` MJPG 1280x720 -> `/dev/video20` YUYV 1280x720, approximately `23.6-24.6 ms/frame` across four 30-frame windows.
-- The difference smoke test used a same-scene reference for pipeline validation, not a clean-room quality claim.
+- `snapshot --frames 3` produced a valid P5 `1280x720` file of 921,616 bytes.
+- The previous screenshot's ghost background remains expected when `background.pgm` was captured with the subject in frame; regenerate it from an empty room.
 - `git diff --check` passes.
 
 ## Next steps
 
-- Capture a true empty-room clean plate, then test person silhouette, hair, glasses, hands, and microphone edges.
-- Add temporal mask smoothing if a real clean plate shows frame-to-frame jitter.
+- Regenerate `background.pgm` with the room empty, fixed exposure/focus, and unchanged lighting.
+- Run the difference path with defaults first; tune threshold only after inspecting a clean-room result.
+- Add temporal mask smoothing if a valid clean plate still flickers around hair, glasses, hands, or the microphone.
 - Consider a model-backed segmentation adapter only if background subtraction cannot meet the visual target.
-- Keep Rayon, native OBS FFI, and hot-plug recovery deferred until mask quality is stable.

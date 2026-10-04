@@ -120,6 +120,7 @@ fn snapshot(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut width = DEFAULT_WIDTH;
     let mut height = DEFAULT_HEIGHT;
     let mut framerate = 30;
+    let mut frames = 30;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -129,6 +130,9 @@ fn snapshot(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             "--height" => height = parse_u32("--height", &next_arg("--height", &mut args)?)?,
             "--framerate" | "-framerate" => {
                 framerate = parse_u32("--framerate", &next_arg("--framerate", &mut args)?)?;
+            }
+            "--frames" => {
+                frames = parse_u32("--frames", &next_arg("--frames", &mut args)?)?;
             }
             "--help" | "-h" => {
                 print_help();
@@ -142,10 +146,16 @@ fn snapshot(mut args: impl Iterator<Item = String>) -> io::Result<()> {
             }
         }
     }
-    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 || framerate == 0 {
+    if width == 0
+        || height == 0
+        || width % 2 != 0
+        || height % 2 != 0
+        || framerate == 0
+        || frames == 0
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "snapshot width and height must be positive even integers and framerate must be greater than zero",
+            "snapshot width and height must be positive even integers, framerate and frames must be greater than zero, and capture must be empty"
         ));
     }
 
@@ -159,15 +169,23 @@ fn snapshot(mut args: impl Iterator<Item = String>) -> io::Result<()> {
     let mut capture = MmapStream::with_buffers(&source_device, Type::VideoCapture, 4)?;
     let needed = (source_format.width * source_format.height * 2) as usize;
     let mut frame = vec![0u8; needed];
+    let mut sums = vec![0u32; source_format.width as usize * source_format.height as usize];
     let mut bad_jpegs = 0;
+    let mut captured = 0;
 
     loop {
+        if captured == frames {
+            break;
+        }
         let (input, metadata) = CaptureStream::next(&mut capture)?;
         let input = &input[..(metadata.bytesused as usize).min(input.len())];
         match source_format.fourcc.str().unwrap_or("") {
             "MJPG" | "JPEG" => {
                 match jpeg_to_yuyv(input, &mut frame, source_format.width, source_format.height) {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        accumulate_luma(&frame, &mut sums);
+                        captured += 1;
+                    }
                     Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                         bad_jpegs += 1;
                         if bad_jpegs >= 30 {
@@ -185,7 +203,8 @@ fn snapshot(mut args: impl Iterator<Item = String>) -> io::Result<()> {
                     ));
                 }
                 frame.copy_from_slice(&input[..needed]);
-                break;
+                accumulate_luma(&frame, &mut sums);
+                captured += 1;
             }
             format => {
                 return Err(io::Error::new(
@@ -196,20 +215,40 @@ fn snapshot(mut args: impl Iterator<Item = String>) -> io::Result<()> {
         }
     }
 
-    write_pgm_luma(&output, &frame, source_format.width, source_format.height)?;
+    let averaged = sums
+        .into_iter()
+        .map(|sum| (sum / captured).min(255) as u8)
+        .collect::<Vec<_>>();
+    write_pgm_luma(
+        &output,
+        &averaged,
+        source_format.width,
+        source_format.height,
+    )?;
     println!(
-        "snapshot: source={} output={} size={}x{}",
+        "snapshot: source={} output={} size={}x{} averaged_frames={} (leave the room empty)",
         source_path.display(),
         output.display(),
         source_format.width,
-        source_format.height
+        source_format.height,
+        captured
     );
     Ok(())
 }
 
-fn write_pgm_luma(path: &Path, frame: &[u8], width: u32, height: u32) -> io::Result<()> {
+fn accumulate_luma(frame: &[u8], sums: &mut [u32]) {
+    for (sum, pair) in sums.iter_mut().zip(frame.chunks_exact(2)) {
+        *sum += u32::from(pair[0]);
+    }
+}
+
+fn write_pgm_luma(path: &Path, luma: &[u8], width: u32, height: u32) -> io::Result<()> {
+    let expected = width as usize * height as usize;
+    if luma.len() != expected {
+        return Err(invalid_mask("snapshot luma size does not match the video"));
+    }
     let mut output = format!("P5\n{} {}\n255\n", width, height).into_bytes();
-    output.extend(frame.chunks_exact(2).map(|pair| pair[0]));
+    output.extend_from_slice(luma);
     fs::write(path, output)
 }
 fn parse_config(mut args: impl Iterator<Item = String>) -> io::Result<Config> {
@@ -411,8 +450,8 @@ fn print_help() {
     println!(
         "vcam - Rust beauty camera bridge for OBS\n\n\
          Usage:\n  vcam list\n  vcam bench\n  vcam snapshot [options]\n  vcam run [options]\n\n\
-         Snapshot options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       P5 grayscale clean-plate output (default: background.pgm)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --framerate N       Capture frame rate (default: 30)\n\n\
-         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze height. 0.33, 0.67, 1 map 720 to 600, 480, 360 (default: 0)\n  --preset NAME       natural or first-take (default: natural)\n  --mask PATH         PGM mask: white keeps the subject, black replaces the background\n  --difference-from PATH\n                      P5/P2 clean plate; generate a soft motion mask from frame differences\n  --mask-threshold N Difference needed before a pixel becomes foreground (default: 18)\n  --mask-softness N  Difference ramp width for soft edges (default: 32)\n  --background R,G,B  Replacement background color (default: 245,245,245)\n  --light-wrap N      Edge light wrap strength, 0..1 (default: 0.12)\n  --stats             Print rolling frame processing timings\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
+         Snapshot options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       P5 grayscale clean-plate output (default: background.pgm)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --framerate N       Capture frame rate (default: 30)\n  --frames N          Average this many clean frames (default: 30)\n\n\
+         Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze height. 0.33, 0.67, 1 map 720 to 600, 480, 360 (default: 0)\n  --preset NAME       natural or first-take (default: natural)\n  --mask PATH         PGM mask: white keeps the subject, black replaces the background\n  --difference-from PATH\n                      P5/P2 clean plate; generate a soft motion mask from frame differences\n  --mask-threshold N Difference needed before a pixel becomes foreground (default: 28)\n  --mask-softness N  Difference ramp width for soft edges (default: 32)\n  --background R,G,B  Replacement background color (default: 245,245,245)\n  --light-wrap N      Edge light wrap strength, 0..1 (default: 0.12)\n  --stats             Print rolling frame processing timings\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
     );
 }
 
@@ -1360,7 +1399,7 @@ fn soften_chroma(value: u8, warmth: i16) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_first_take, apply_rotation, beautify_yuyv, composite_mask_yuyv,
+        accumulate_luma, apply_first_take, apply_rotation, beautify_yuyv, composite_mask_yuyv,
         generate_difference_mask, parse_config, parse_pgm_mask, parse_video_filter, rgb_to_yuv,
         Level, Preset, Rotation,
     };
@@ -1392,6 +1431,13 @@ mod tests {
         assert_eq!(frame, [235, 128, 235, 128, 235, 128, 235, 128]);
     }
 
+    #[test]
+    fn accumulated_luma_averages_yuyv_rows() {
+        let mut sums = vec![0u32; 2];
+        accumulate_luma(&[10, 128, 30, 128], &mut sums);
+        accumulate_luma(&[20, 128, 40, 128], &mut sums);
+        assert_eq!(sums, [30, 70]);
+    }
     #[test]
     fn difference_mask_has_threshold_and_soft_edge() {
         let frame = [10, 128, 40, 128, 80, 128, 120, 128];
