@@ -50,6 +50,7 @@ pub(crate) fn run(config: super::Config) -> io::Result<()> {
                     ..Default::default()
                 }),
                 window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
+                app_id: Some("com.v1cc0.vcam".to_string()),
                 ..Default::default()
             };
 

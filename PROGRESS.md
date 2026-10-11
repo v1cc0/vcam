@@ -20,6 +20,7 @@
 - Before the leak fix, the kernel logged `amdgpu ... Not enough memory for command submission`, app-slice OOM activity, and `ghostty`/`btm` aborts after a long preview run.
 - After the fix, a 45-second Wayland run at `640x480@15` held vcam RSS at about `155–157 MB` with no new `amdgpu` or OOM log entries.
 - A release build run at `1280x720@30` held RSS at about `115.8 MB` for 90 seconds, with no new `amdgpu` or OOM log entries; the process ended only because the test timeout sent TERM.
+- Set and live-verified the GPUI preview window application ID as `com.v1cc0.vcam` in niri, enabling niri window rules.
 
 ## Next steps
 
