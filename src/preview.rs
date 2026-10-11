@@ -68,6 +68,7 @@ struct PreviewView {
     requested_height: u32,
     framerate: u32,
     image: Option<Arc<RenderImage>>,
+    pending_frame: Option<CapturedFrame>,
     status: String,
     captured_frames: u64,
     shared: Arc<Mutex<SharedPreview>>,
@@ -118,7 +119,7 @@ impl PreviewView {
                     view.status = update.1;
                     view.captured_frames = update.2;
                     if let Some(frame) = update.0 {
-                        view.image = Some(render_image(frame));
+                        view.pending_frame = Some(frame);
                     }
                     cx.notify();
                 })
@@ -139,6 +140,7 @@ impl PreviewView {
             requested_height,
             framerate,
             image: None,
+            pending_frame: None,
             status: "等待摄像头帧".to_string(),
             captured_frames: 0,
             shared,
@@ -156,7 +158,15 @@ impl Drop for PreviewView {
 }
 
 impl Render for PreviewView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(frame) = self.pending_frame.take() {
+            if let Some(previous) = self.image.take() {
+                // GPUI does not automatically evict unique per-frame images from the atlas.
+                let _ = window.drop_image(previous);
+            }
+            self.image = Some(render_image(frame));
+        }
+
         let preview = match &self.image {
             Some(image) => img(ImageSource::Render(Arc::clone(image)))
                 .size_full()
