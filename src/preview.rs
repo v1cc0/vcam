@@ -4,10 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use gpui_kit::component::{
+    checkbox::Checkbox,
+    slider::{Slider, SliderEvent, SliderState},
+};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, rgb, size, Context, ImageSource, ObjectFit, Render, RenderImage, SharedString,
-    Task, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    div, img, px, rgb, size, Context, Entity, ImageSource, ObjectFit, Render, RenderImage,
+    SharedString, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use image::RgbaImage;
 use v4l::buffer::Type;
@@ -18,6 +22,7 @@ use v4l::Device;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(33);
 
+#[derive(Clone)]
 struct CapturedFrame {
     width: u32,
     height: u32,
@@ -54,8 +59,8 @@ pub(crate) fn run(config: super::Config) -> io::Result<()> {
                 ..Default::default()
             };
 
-            gpui_kit::open_window(options, cx, |_, cx| {
-                cx.new(|cx| PreviewView::new(source_path, width, height, framerate, cx))
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| PreviewView::new(source_path, width, height, framerate, window, cx))
             })
             .expect("failed to open vcam preview window");
         });
@@ -68,8 +73,15 @@ struct PreviewView {
     requested_width: u32,
     requested_height: u32,
     framerate: u32,
-    image: Option<Arc<RenderImage>>,
+    original_image: Option<Arc<RenderImage>>,
+    processed_image: Option<Arc<RenderImage>>,
+    last_frame: Option<CapturedFrame>,
     pending_frame: Option<CapturedFrame>,
+    brightness: Entity<SliderState>,
+    contrast: Entity<SliderState>,
+    flip_horizontal: bool,
+    effects_dirty: bool,
+    _subscriptions: Vec<Subscription>,
     status: String,
     captured_frames: u64,
     shared: Arc<Mutex<SharedPreview>>,
@@ -82,8 +94,33 @@ impl PreviewView {
         requested_width: u32,
         requested_height: u32,
         framerate: u32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let brightness = cx.new(|_| {
+            SliderState::new()
+                .min(-1.)
+                .max(1.)
+                .step(0.05)
+                .default_value(0.)
+        });
+        let contrast = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                .max(2.)
+                .step(0.05)
+                .default_value(1.)
+        });
+        let subscriptions = vec![
+            cx.subscribe_in(&brightness, window, |this, _, _: &SliderEvent, _, cx| {
+                this.effects_dirty = true;
+                cx.notify();
+            }),
+            cx.subscribe_in(&contrast, window, |this, _, _: &SliderEvent, _, cx| {
+                this.effects_dirty = true;
+                cx.notify();
+            }),
+        ];
         let shared = Arc::new(Mutex::new(SharedPreview {
             latest: None,
             status: format!("Opening {}", source.display()),
@@ -140,8 +177,15 @@ impl PreviewView {
             requested_width,
             requested_height,
             framerate,
-            image: None,
+            original_image: None,
+            processed_image: None,
+            last_frame: None,
             pending_frame: None,
+            brightness,
+            contrast,
+            flip_horizontal: false,
+            effects_dirty: false,
+            _subscriptions: subscriptions,
             status: "等待摄像头帧".to_string(),
             captured_frames: 0,
             shared,
@@ -159,32 +203,52 @@ impl Drop for PreviewView {
 }
 
 impl Render for PreviewView {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let brightness = self.brightness.read(cx).value().start();
+        let contrast = self.contrast.read(cx).value().start();
         if let Some(frame) = self.pending_frame.take() {
-            if let Some(previous) = self.image.take() {
-                // GPUI does not automatically evict unique per-frame images from the atlas.
+            if let Some(previous) = self.original_image.take() {
                 let _ = window.drop_image(previous);
             }
-            self.image = Some(render_image(frame));
+            if let Some(previous) = self.processed_image.take() {
+                let _ = window.drop_image(previous);
+            }
+            self.last_frame = Some(frame);
+            if let Some(frame) = self.last_frame.as_ref() {
+                self.original_image = Some(render_image(frame.clone()));
+                self.processed_image = Some(render_image(apply_effects(
+                    frame,
+                    brightness,
+                    contrast,
+                    self.flip_horizontal,
+                )));
+            }
+            self.effects_dirty = false;
+        } else if self.effects_dirty {
+            if let Some(frame) = self.last_frame.as_ref() {
+                if let Some(previous) = self.processed_image.take() {
+                    let _ = window.drop_image(previous);
+                }
+                self.processed_image = Some(render_image(apply_effects(
+                    frame,
+                    brightness,
+                    contrast,
+                    self.flip_horizontal,
+                )));
+            }
+            self.effects_dirty = false;
         }
 
-        let preview = match &self.image {
-            Some(image) => img(ImageSource::Render(Arc::clone(image)))
-                .size_full()
-                .object_fit(ObjectFit::Contain)
-                .into_any_element(),
-            None => div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .size_full()
-                .text_color(rgb(0x94a3b8))
-                .child("Waiting for camera frame")
-                .child(self.status.clone())
-                .into_any_element(),
-        };
+        let original = image_element(
+            self.original_image.as_ref(),
+            "Waiting for camera frame",
+            &self.status,
+        );
+        let processed = image_element(
+            self.processed_image.as_ref(),
+            "Waiting for processed frame",
+            &self.status,
+        );
 
         div()
             .size_full()
@@ -195,6 +259,7 @@ impl Render for PreviewView {
             .child(
                 div()
                     .h(px(56.))
+                    .flex_shrink_0()
                     .px_4()
                     .flex()
                     .items_center()
@@ -226,6 +291,7 @@ impl Render for PreviewView {
             .child(
                 div()
                     .flex_1()
+                    .min_h_0()
                     .flex()
                     .gap_3()
                     .p_3()
@@ -233,23 +299,20 @@ impl Render for PreviewView {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .min_h_0()
                             .flex()
                             .flex_col()
                             .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_h(px(240.))
-                                    .bg(rgb(0x05070a))
-                                    .border_1()
-                                    .border_color(rgb(0x334155))
-                                    .items_center()
-                                    .justify_center()
-                                    .child(preview),
-                            )
+                            .child(preview_pane(
+                                format!("Original {}", self.source.display()),
+                                original,
+                            ))
+                            .child(preview_pane("After effects".to_string(), processed))
                             .child(
                                 div()
                                     .h(px(30.))
+                                    .flex_shrink_0()
                                     .px_2()
                                     .flex()
                                     .items_center()
@@ -257,14 +320,15 @@ impl Render for PreviewView {
                                     .text_xs()
                                     .text_color(rgb(0x94a3b8))
                                     .child(self.status.clone())
-                                    .child("Preview only · output pipeline unchanged"),
+                                    .child("Live capture · processed preview below"),
                             ),
                     )
-                    .child(control_panel()),
+                    .child(control_panel(self, cx)),
             )
             .child(
                 div()
                     .h(px(34.))
+                    .flex_shrink_0()
                     .px_4()
                     .flex()
                     .items_center()
@@ -299,9 +363,14 @@ fn side_panel() -> impl IntoElement {
         .child(info_row("Output", "Not connected"))
 }
 
-fn control_panel() -> impl IntoElement {
+fn control_panel(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl IntoElement {
+    let brightness = view.brightness.read(cx).value().start();
+    let contrast = view.contrast.read(cx).value().start();
+
     div()
-        .w(px(220.))
+        .w(px(240.))
+        .flex_shrink_0()
+        .min_h_0()
         .flex()
         .flex_col()
         .gap_3()
@@ -309,17 +378,121 @@ fn control_panel() -> impl IntoElement {
         .border_1()
         .border_color(rgb(0x2b3542))
         .p_3()
-        .child(section_title("Controls"))
-        .child(info_row("Brightness", "Auto"))
-        .child(info_row("Contrast", "Default"))
-        .child(info_row("White balance", "Auto"))
+        .child(section_title("Effects"))
+        .child(effect_slider(
+            "Brightness",
+            format!("{brightness:+.2}"),
+            Slider::new(&view.brightness).w(px(190.)),
+        ))
+        .child(effect_slider(
+            "Contrast",
+            format!("{contrast:.2}"),
+            Slider::new(&view.contrast).w(px(190.)),
+        ))
+        .child(
+            Checkbox::new("flip-horizontal")
+                .checked(view.flip_horizontal)
+                .label("Horizontal flip")
+                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                    this.flip_horizontal = *checked;
+                    this.effects_dirty = true;
+                    cx.notify();
+                })),
+        )
+        .child(section_title("Camera"))
+        .child(info_row("Input", "V4L2 camera"))
+        .child(info_row("Exposure", "Auto"))
+        .child(info_row("Gain", "Auto"))
         .child(
             div()
                 .mt_2()
                 .text_xs()
                 .text_color(rgb(0x64748b))
-                .child("V4L2 controls will be wired after the preview path is stable."),
+                .child("Controls affect the lower processed preview."),
         )
+}
+
+fn effect_slider<E: IntoElement>(
+    label: &'static str,
+    value: String,
+    slider: E,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .text_sm()
+                .child(label)
+                .child(div().text_color(rgb(0x94a3b8)).child(value)),
+        )
+        .child(slider)
+}
+
+fn preview_pane(title: String, image: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w_0()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .bg(rgb(0x05070a))
+        .border_1()
+        .border_color(rgb(0x334155))
+        .overflow_hidden()
+        .child(
+            div()
+                .h(px(28.))
+                .flex_shrink_0()
+                .px_2()
+                .flex()
+                .items_center()
+                .text_xs()
+                .text_color(rgb(0x94a3b8))
+                .child(title),
+        )
+        .child(image)
+}
+
+fn image_element(
+    image: Option<&Arc<RenderImage>>,
+    waiting_label: &'static str,
+    status: &str,
+) -> impl IntoElement {
+    match image {
+        Some(image) => div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .child(
+                img(ImageSource::Render(Arc::clone(image)))
+                    .size_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .object_fit(ObjectFit::Contain),
+            )
+            .into_any_element(),
+        None => div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .text_color(rgb(0x94a3b8))
+            .child(waiting_label)
+            .child(status.to_string())
+            .into_any_element(),
+    }
 }
 
 fn section_title(title: &'static str) -> impl IntoElement {
@@ -442,6 +615,38 @@ fn rgb_pixel(y: u8, u: i32, v: i32) -> [u8; 4] {
     ]
 }
 
+fn apply_effects(
+    frame: &CapturedFrame,
+    brightness: f32,
+    contrast: f32,
+    flip_horizontal: bool,
+) -> CapturedFrame {
+    let mut bgra = frame.bgra.clone();
+    for pixel in bgra.chunks_exact_mut(4) {
+        for channel in &mut pixel[..3] {
+            let adjusted = (f32::from(*channel) - 128.) * contrast + 128. + brightness * 255.;
+            *channel = adjusted.round().clamp(0., 255.) as u8;
+        }
+    }
+    if flip_horizontal {
+        let row_bytes = frame.width as usize * 4;
+        for row in bgra.chunks_exact_mut(row_bytes) {
+            for x in 0..frame.width as usize / 2 {
+                let left = x * 4;
+                let right = (frame.width as usize - 1 - x) * 4;
+                for channel in 0..4 {
+                    row.swap(left + channel, right + channel);
+                }
+            }
+        }
+    }
+    CapturedFrame {
+        width: frame.width,
+        height: frame.height,
+        bgra,
+    }
+}
+
 fn render_image(frame: CapturedFrame) -> Arc<RenderImage> {
     Arc::new(RenderImage::new(vec![image::Frame::new(
         RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
@@ -451,7 +656,21 @@ fn render_image(frame: CapturedFrame) -> Arc<RenderImage> {
 
 #[cfg(test)]
 mod tests {
-    use super::yuyv_to_bgra;
+    use super::{apply_effects, yuyv_to_bgra, CapturedFrame};
+
+    #[test]
+    fn effects_change_only_processed_frame_and_can_flip_it() {
+        let frame = CapturedFrame {
+            width: 2,
+            height: 1,
+            bgra: vec![10, 20, 30, 255, 200, 210, 220, 255],
+        };
+
+        let processed = apply_effects(&frame, 0.1, 1.0, true);
+
+        assert_eq!(frame.bgra, vec![10, 20, 30, 255, 200, 210, 220, 255]);
+        assert_eq!(processed.bgra, vec![226, 236, 246, 255, 36, 46, 56, 255]);
+    }
 
     #[test]
     fn yuyv_preview_conversion_keeps_neutral_black_and_white() {

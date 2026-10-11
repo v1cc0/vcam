@@ -33,7 +33,7 @@ Open the GPUI Kit AMCap-style live preview without creating a loopback output:
 cargo run --release -- --preview --source /dev/video1 --width 1280 --height 720 --framerate 30
 ```
 
-The preview owns the physical V4L2 capture device and displays the latest decoded frame in a native window. Its control panels are intentionally read-only in this first pass; `vcam run` remains the OBS loopback path.
+The preview owns the physical V4L2 capture device and displays the latest decoded frame in a split central workspace: the upper pane shows the original `/dev/video*` capture and the lower pane shows the processed result. The right panel provides live brightness, contrast, and horizontal-flip controls for the lower pane; `vcam run` remains the OBS loopback path.
 
 List V4L2 nodes and capabilities:
 
