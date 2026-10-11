@@ -17,6 +17,8 @@ use v4l::prelude::MmapStream;
 use v4l::video::{Capture, Output};
 use v4l::Device;
 
+mod preview;
+
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 const DEFAULT_STRENGTH: f32 = 0.35;
@@ -70,6 +72,11 @@ fn main() -> io::Result<()> {
         Some("run") => match parse_config(args) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(()),
             Ok(config) => run(config),
+            Err(error) => Err(error),
+        },
+        Some("--preview") => match parse_config(args) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(()),
+            Ok(config) => preview::run(config),
             Err(error) => Err(error),
         },
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -460,7 +467,7 @@ fn parse_rgb(value: &str) -> io::Result<[u8; 3]> {
 fn print_help() {
     println!(
         "vcam - Rust beauty camera bridge for OBS\n\n\
-         Usage:\n  vcam list\n  vcam bench\n  vcam snapshot [options]\n  vcam run [options]\n\n\
+         Usage:\n  vcam list\n  vcam bench\n  vcam snapshot [options]\n  vcam run [options]\n  vcam --preview [options]\n\n\
          Snapshot options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       P5 grayscale clean-plate output (default: background.pgm)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --framerate N       Capture frame rate (default: 30)\n  --frames N          Average this many clean frames (default: 30)\n\n\
          Options:\n  --source PATH       Input V4L2 camera; omitted selects the first USB capture device\n  --output PATH       v4l2loopback output (default: /dev/video20)\n  --width N           Capture width (default: 1280)\n  --height N          Capture height (default: 720)\n  --strength N        Smoothing strength, 0..1 (default: 0.35)\n  --slim N            Squeeze height. 0.33, 0.67, 1 map 720 to 600, 480, 360 (default: 0)\n  --preset NAME       natural or first-take (default: natural)\n  --mask PATH         PGM mask: white keeps the subject, black replaces the background\n  --difference-from PATH\n                      P5/P2 clean plate; generate a soft motion mask from frame differences\n  --dump-mask PATH    Save the first generated difference mask as a PGM\n  --mask-threshold N Difference needed before a pixel becomes foreground (default: 28)\n  --mask-softness N  Difference ramp width for soft edges (default: 32)\n  --background R,G,B  Replacement background color (default: 232,232,232)\n  --light-wrap N      Edge light wrap strength, 0..1 (default: 0.12)\n  --stats             Print rolling frame processing timings\n  --framerate N       Capture/output frame rate (default: 30)\n  --vf FILTER         transpose=1|2|clock|cclock, hflip, or vflip\n  --compare           Show the raw camera on the left and the processed output on the right\n  --no-preview        Do not launch ffplay to preview the output"
     );

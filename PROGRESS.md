@@ -2,24 +2,28 @@
 
 ## Current round
 
-- Reduced `first-take` luma lift from 24 to 10; the SIMD and scalar paths now preserve more facial, hair, and shirt detail.
-- Added `--dump-mask PATH` to save the first generated difference mask for diagnosis.
-- Added frame-wide median luma-shift compensation before difference thresholding, reducing false foreground from auto-exposure drift.
-- Reduced the default replacement background from YUV-equivalent RGB `245,245,245` to `232,232,232` to keep high-key whites from clipping.
-- Confirmed from the exported mask and grayscale `background.pgm` that the current local plate still contains the person; this cannot be repaired by threshold or tone settings.
+- Added `gpui-kit 0.7.1` and `image 0.25.10` to support the first native preview UI.
+- Added `vcam --preview [options]` without changing the existing `vcam run` OBS loopback path.
+- Added `src/preview.rs`: V4L2 capture thread, MJPEG/YUYV decode reuse, latest-frame state, YUYV-to-BGRA conversion, GPUI Kit window and AMCap-style layout.
+- Added clean shutdown signaling for the capture thread when the preview entity is dropped.
+- Updated `PLAN.md` and `README.md` with the preview scope and next stages.
 
 ## Verification
 
-- `cargo fmt -- --check` passes.
-- `cargo test`: 17 tests passed.
+- `cargo fmt --all -- --check` passes.
+- `cargo check` passes.
 - `cargo build --release` passes.
-- Difference smoke test with `--preset natural --light-wrap 0` ran at approximately `20.85-21.33 ms/frame` and wrote a valid `1280x720` P5 mask.
-- Added a regression test proving a uniform exposure shift does not create a difference mask.
-- `git diff --check` passes.
+- `cargo test`: 18 tests passed, including the preview color conversion regression test.
+- `cargo run -- --help` lists `vcam --preview [options]`.
+- Short GUI smoke test with `/dev/video1` at `640x480@15` kept the GPUI event loop alive for 12 seconds without capture or window errors; a Wayland screenshot confirmed live frames, frame counter updates, and the AMCap layout.
 
 ## Next steps
 
-- Re-capture `background.pgm` while fully out of frame, with fixed exposure/focus and unchanged lighting.
-- Inspect `--dump-mask` before judging final compositing.
-- Run `--preset natural --light-wrap 0` first, then enable `first-take` and Light Wrap separately.
-- Add temporal mask smoothing only after a valid clean plate still flickers around hair, glasses, hands, or the microphone.
+- Wire real V4L2 controls and device/format selection into the UI.
+- Add screenshot, recording, and loopback output actions.
+- Measure 30-second CPU/memory and frame delivery behavior; then decide whether the GPUI image path needs a lower-rate preview or a separate video surface.
+
+## User files
+
+- Keep the untracked `background.pgm` unchanged and out of commits.
+- `PROGRESS.md.lastround` is the local backup for this round and remains ignored.

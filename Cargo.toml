@@ -7,5 +7,7 @@ license = "MIT"
 
 [dependencies]
 fearless_simd = "1.0"
+gpui-kit = "0.7.1"
+image = { version = "0.25.10", default-features = false }
 jpeg-decoder = "0.3.2"
 v4l = "0.14.0"
