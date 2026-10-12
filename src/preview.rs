@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use gpui_kit::base::Disableable;
+use gpui_kit::base::{Button, Disableable};
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::{
     accordion::Accordion,
     checkbox::Checkbox,
@@ -14,7 +15,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, rgb, size, Context, Entity, ImageSource, ObjectFit, Render, RenderImage,
+    div, hsla, img, px, rgb, size, Context, Entity, ImageSource, ObjectFit, Render, RenderImage,
     SharedString, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use image::RgbaImage;
@@ -49,6 +50,7 @@ struct ControlSpec {
     maximum: i64,
     step: u64,
     value: i64,
+    default: i64,
     inactive: bool,
 }
 
@@ -93,6 +95,7 @@ pub(crate) fn run(config: super::Config) -> io::Result<()> {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            configure_theme(cx);
             cx.activate(true);
 
             let options = WindowOptions {
@@ -114,6 +117,44 @@ pub(crate) fn run(config: super::Config) -> io::Result<()> {
         });
 
     Ok(())
+}
+
+fn configure_theme(cx: &mut gpui_kit::App) {
+    Theme::change(ThemeMode::Dark, None, cx);
+    Theme::update(cx, |theme| {
+        let black = hsla(0., 0., 0., 1.);
+        let white = hsla(0., 0., 1., 1.);
+
+        theme.colors.background = black;
+        theme.colors.foreground = white;
+        theme.colors.accordion = black;
+        theme.colors.border = white;
+        theme.colors.input = black;
+        theme.colors.muted = black;
+        theme.colors.muted_foreground = white;
+        theme.colors.popover = black;
+        theme.colors.popover_foreground = white;
+        theme.colors.list = black;
+        theme.colors.list_active = white;
+        theme.colors.list_active_border = white;
+        theme.colors.list_even = black;
+        theme.colors.list_head = black;
+        theme.colors.list_hover = black;
+        theme.colors.primary = white;
+        theme.colors.primary_active = white;
+        theme.colors.primary_foreground = black;
+        theme.colors.primary_hover = white;
+        theme.colors.accent = white;
+        theme.colors.accent_foreground = black;
+        theme.colors.button = black;
+        theme.colors.button_active = white;
+        theme.colors.button_foreground = white;
+        theme.colors.button_hover = black;
+        theme.colors.ring = white;
+        theme.colors.scrollbar = black;
+        theme.colors.scrollbar_thumb = white;
+        theme.colors.scrollbar_thumb_hover = white;
+    });
 }
 
 struct PreviewView {
@@ -361,9 +402,71 @@ impl PreviewView {
         }
     }
 
-    fn set_camera_control(&mut self, name: &str, value: i64) {
+    fn reset_camera_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut failures = 0;
+        let mut skipped = 0;
+        let defaults: Vec<(String, i64, bool)> = CAMERA_CONTROL_NAMES
+            .iter()
+            .filter_map(|name| {
+                self.camera_controls
+                    .spec(name)
+                    .map(|spec| ((*name).to_string(), spec.default, spec.inactive))
+            })
+            .collect();
+
+        for (name, default, inactive) in defaults {
+            if inactive {
+                skipped += 1;
+                continue;
+            }
+            let updated = if name == "white_balance_automatic" {
+                self.set_boolean_control(&name, default != 0)
+            } else {
+                self.set_camera_control(&name, default)
+            };
+            if !updated {
+                failures += 1;
+            }
+        }
+
+        let slider_defaults = [
+            (&self.camera_brightness, "brightness"),
+            (&self.camera_contrast, "contrast"),
+            (&self.saturation, "saturation"),
+            (&self.hue, "hue"),
+            (&self.gamma, "gamma"),
+            (&self.gain, "gain"),
+            (&self.power_line_frequency, "power_line_frequency"),
+            (&self.white_balance_temperature, "white_balance_temperature"),
+            (&self.sharpness, "sharpness"),
+            (&self.auto_exposure, "auto_exposure"),
+            (&self.exposure_time_absolute, "exposure_time_absolute"),
+        ];
+        for (slider, name) in slider_defaults {
+            if let Some(spec) = self.camera_controls.spec(name) {
+                slider.update(cx, |state, cx| {
+                    state.set_value(spec.default as f32, window, cx)
+                });
+            }
+        }
+        self.white_balance_automatic = self
+            .camera_controls
+            .spec("white_balance_automatic")
+            .is_some_and(|spec| spec.default != 0);
+        self.backlight_compensation = self
+            .camera_controls
+            .spec("backlight_compensation")
+            .is_some_and(|spec| spec.default != 0);
+        self.control_message = Some(if failures == 0 && skipped == 0 {
+            "Camera defaults restored".to_string()
+        } else {
+            format!("Camera defaults restored; {failures} failed, {skipped} inactive")
+        });
+    }
+
+    fn set_camera_control(&mut self, name: &str, value: i64) -> bool {
         let Some(spec) = self.camera_controls.spec(name) else {
-            return;
+            return false;
         };
         let value = value.clamp(spec.minimum, spec.maximum);
         let result = Device::with_path(&self.source).and_then(|device| {
@@ -373,16 +476,23 @@ impl PreviewView {
             })
         });
         match result {
-            Ok(()) => self.control_message = Some(format!("{name} = {value}")),
+            Ok(()) => {
+                if let Some(spec) = self.camera_controls.specs.get_mut(name) {
+                    spec.value = value;
+                }
+                self.control_message = Some(format!("{name} = {value}"));
+                true
+            }
             Err(error) => {
                 self.control_message = Some(format!("{name}: {error}"));
+                false
             }
         }
     }
 
-    fn set_boolean_control(&mut self, name: &str, value: bool) {
+    fn set_boolean_control(&mut self, name: &str, value: bool) -> bool {
         let Some(spec) = self.camera_controls.spec(name) else {
-            return;
+            return false;
         };
         let result = Device::with_path(&self.source).and_then(|device| {
             device.set_control(Control {
@@ -391,9 +501,16 @@ impl PreviewView {
             })
         });
         match result {
-            Ok(()) => self.control_message = Some(format!("{name} = {value}")),
+            Ok(()) => {
+                if let Some(spec) = self.camera_controls.specs.get_mut(name) {
+                    spec.value = i64::from(value);
+                }
+                self.control_message = Some(format!("{name} = {value}"));
+                true
+            }
             Err(error) => {
                 self.control_message = Some(format!("{name}: {error}"));
+                false
             }
         }
     }
@@ -461,8 +578,8 @@ impl Render for PreviewView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x11161d))
-            .text_color(rgb(0xe2e8f0))
+            .bg(rgb(0x000000))
+            .text_color(rgb(0xffffff))
             .child(
                 div()
                     .h(px(56.))
@@ -472,12 +589,12 @@ impl Render for PreviewView {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(rgb(0x2b3542))
+                    .border_color(rgb(0xffffff))
                     .child(
                         div().flex().flex_col().gap_1().child("vcam preview").child(
                             div()
                                 .text_sm()
-                                .text_color(rgb(0x94a3b8))
+                                .text_color(rgb(0xffffff))
                                 .child(self.source.display().to_string()),
                         ),
                     )
@@ -487,7 +604,7 @@ impl Render for PreviewView {
                             .items_center()
                             .gap_3()
                             .text_sm()
-                            .text_color(rgb(0x94a3b8))
+                            .text_color(rgb(0xffffff))
                             .child(format!(
                                 "{}x{} @ {} FPS",
                                 self.requested_width, self.requested_height, self.framerate
@@ -525,7 +642,7 @@ impl Render for PreviewView {
                                     .items_center()
                                     .justify_between()
                                     .text_xs()
-                                    .text_color(rgb(0x94a3b8))
+                                    .text_color(rgb(0xffffff))
                                     .child(self.status.clone())
                                     .child("Live capture · processed preview below"),
                             ),
@@ -541,9 +658,9 @@ impl Render for PreviewView {
                     .items_center()
                     .justify_between()
                     .border_t_1()
-                    .border_color(rgb(0x2b3542))
+                    .border_color(rgb(0xffffff))
                     .text_xs()
-                    .text_color(rgb(0x64748b))
+                    .text_color(rgb(0xffffff))
                     .child("AMCap-style camera monitor")
                     .child("Close the window to stop capture"),
             )
@@ -556,9 +673,9 @@ fn side_panel() -> impl IntoElement {
         .flex()
         .flex_col()
         .gap_3()
-        .bg(rgb(0x171e27))
+        .bg(rgb(0x000000))
         .border_1()
-        .border_color(rgb(0x2b3542))
+        .border_color(rgb(0xffffff))
         .p_3()
         .child(section_title("Device"))
         .child(info_row("Input", "V4L2 camera"))
@@ -580,6 +697,8 @@ fn discover_camera_controls(source: &Path) -> CameraControls {
             if !CAMERA_CONTROL_NAMES.contains(&name.as_str()) {
                 continue;
             }
+            let (minimum, maximum) =
+                ordered_control_bounds(description.minimum, description.maximum);
             let value = device
                 .control(description.id)
                 .ok()
@@ -588,9 +707,9 @@ fn discover_camera_controls(source: &Path) -> CameraControls {
                     ControlValue::Boolean(value) => Some(i64::from(value)),
                     _ => None,
                 })
-                .unwrap_or(description.default);
-            let (minimum, maximum) =
-                ordered_control_bounds(description.minimum, description.maximum);
+                .unwrap_or(description.default)
+                .clamp(minimum, maximum);
+            let default = description.default.clamp(minimum, maximum);
             specs.insert(
                 name,
                 ControlSpec {
@@ -599,6 +718,7 @@ fn discover_camera_controls(source: &Path) -> CameraControls {
                     maximum,
                     step: description.step.max(1),
                     value,
+                    default,
                     inactive: description.flags.contains(ControlFlags::INACTIVE),
                 },
             );
@@ -678,10 +798,24 @@ fn control_panel(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl Into
         .overflow_y_scrollbar()
         .flex()
         .flex_col()
-        .bg(rgb(0x171e27))
+        .bg(rgb(0x000000))
         .border_1()
-        .border_color(rgb(0x2b3542))
+        .border_color(rgb(0xffffff))
         .p_2()
+        .child(
+            Button::new("reset-camera-defaults")
+                .accessibility_label("Reset camera defaults")
+                .px_2()
+                .py_1()
+                .border_1()
+                .border_color(rgb(0xffffff))
+                .text_color(rgb(0xffffff))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.reset_camera_defaults(window, cx);
+                    cx.notify();
+                }))
+                .child("Reset camera defaults"),
+        )
         .child(
             Accordion::new("preview-controls")
                 .multiple(true)
@@ -711,7 +845,7 @@ fn control_panel(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl Into
                 div()
                     .mt_2()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(0xffffff))
                     .child(message),
             )
         })
@@ -852,7 +986,7 @@ fn camera_controls(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl In
             element.child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0xfca5a5))
+                    .text_color(rgb(0xffffff))
                     .child(format!("V4L2 controls unavailable: {error}")),
             )
         })
@@ -938,7 +1072,7 @@ fn software_effects(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl I
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x64748b))
+                .text_color(rgb(0xffffff))
                 .child("Only the lower preview uses software effects."),
         )
 }
@@ -984,15 +1118,13 @@ fn filter_option(
         .py_1()
         .rounded_sm()
         .text_sm()
-        .text_color(if selected {
-            rgb(0x7dd3fc)
+        .text_color(rgb(0xffffff))
+        .bg(rgb(0x000000))
+        .border_1()
+        .border_color(if selected {
+            rgb(0xffffff)
         } else {
-            rgb(0xcbd5e1)
-        })
-        .bg(if selected {
-            rgb(0x243b53)
-        } else {
-            rgb(0x1d2733)
+            rgb(0x000000)
         })
         .on_click(cx.listener(move |this, _, _, cx| {
             this.rotation = rotation;
@@ -1017,7 +1149,7 @@ fn effect_slider<E: IntoElement>(
                 .justify_between()
                 .text_sm()
                 .child(label)
-                .child(div().text_color(rgb(0x94a3b8)).child(value)),
+                .child(div().text_color(rgb(0xffffff)).child(value)),
         )
         .child(slider)
 }
@@ -1029,9 +1161,9 @@ fn preview_pane(title: String, image: impl IntoElement) -> impl IntoElement {
         .min_h_0()
         .flex()
         .flex_col()
-        .bg(rgb(0x05070a))
+        .bg(rgb(0x000000))
         .border_1()
-        .border_color(rgb(0x334155))
+        .border_color(rgb(0xffffff))
         .overflow_hidden()
         .child(
             div()
@@ -1041,7 +1173,7 @@ fn preview_pane(title: String, image: impl IntoElement) -> impl IntoElement {
                 .flex()
                 .items_center()
                 .text_xs()
-                .text_color(rgb(0x94a3b8))
+                .text_color(rgb(0xffffff))
                 .child(title),
         )
         .child(image)
@@ -1078,7 +1210,7 @@ fn image_element(
             .items_center()
             .justify_center()
             .gap_2()
-            .text_color(rgb(0x94a3b8))
+            .text_color(rgb(0xffffff))
             .child(waiting_label)
             .child(status.to_string())
             .into_any_element(),
@@ -1086,7 +1218,7 @@ fn image_element(
 }
 
 fn section_title(title: &'static str) -> impl IntoElement {
-    div().text_sm().text_color(rgb(0x38bdf8)).child(title)
+    div().text_sm().text_color(rgb(0xffffff)).child(title)
 }
 
 fn info_row(label: &'static str, value: &'static str) -> impl IntoElement {
@@ -1096,7 +1228,7 @@ fn info_row(label: &'static str, value: &'static str) -> impl IntoElement {
         .gap_2()
         .text_sm()
         .child(label)
-        .child(div().text_color(rgb(0x94a3b8)).child(value))
+        .child(div().text_color(rgb(0xffffff)).child(value))
 }
 
 fn capture_loop(

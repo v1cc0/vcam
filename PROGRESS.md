@@ -2,22 +2,22 @@
 
 ## 本轮完成
 
-- `vcam --preview` 右侧接入选定 `/dev/video*` 的 V4L2 控件：brightness、contrast、saturation、hue、white balance automatic、gamma、gain、power line frequency、white balance temperature、sharpness、backlight compensation、auto exposure、exposure time。
-- 控件值通过 `v4l` 直接写回设备；`backlight_compensation` 按设备实际整数 `0/1` 写入，自动白平衡仍按 Boolean 写入。
-- 右侧面板分为可折叠的 Camera controls、Video filters、Software effects；预览滤镜支持 `none`、`transpose=1`、`transpose=2`、`hflip`、`vflip`。
-- 处理了 GPUI 滑块的非默认范围初始化：高于 `100` 的最小值先设置最大值，低于 `0` 的范围反向设置；V4L2 反向元数据范围统一排序。
-- 恢复右侧 `320px` 固定宽度，避免 Accordion 横向撑开并覆盖中间原始/处理双预览。
-- 保留原始/处理图像资源替换前的 `Window::drop_image` 回收逻辑。
+- 在 `vcam --preview` 的 `Camera controls` 面板加入 `Reset camera defaults` 按钮。
+- 保存 V4L2 控件描述中的默认值；点击按钮时按 V4L2 控件顺序恢复所有可用参数，并同步硬件写回、滑块和复选框状态。
+- 对当前 inactive 或写回失败的控件显示计数，不将部分成功伪装为全部成功。
+- 配置 GPUI Kit 应用级主题：纯黑背景、纯白文字、纯白边框；Accordion、Slider、Checkbox、滚动条和滤镜选中态均不再回退到浅色默认样式。
+- 更新 README 和 PLAN，保留 `vcam run`、实时双画面、控件写回和图像资源回收行为不变。
 
 ## 验证
 
 - `cargo fmt --all -- --check` 通过。
 - `cargo check` 通过。
 - `cargo test`：21 项全部通过。
+- `cargo build --release` 通过。
 - `git diff --check` 通过。
-- `/dev/video1`、`640x480@15` 真实 Wayland smoke test 启动无 panic、无日志错误，帧数持续增长；截图确认左侧设备栏、中间上下双预览和右侧固定控制栏互不覆盖。
+- 已扫描 `src/preview.rs` 颜色值，显式颜色仅使用 `rgb(0x000000)` 和 `rgb(0xffffff)`；GPUI 组件主题同步使用黑白 HSL。
+- `/dev/video1`、`640x480@15` 的 release Wayland smoke test 运行稳定，无日志错误；截图确认重置按钮可见、黑白主题生效、三栏布局和上下双预览无覆盖。
 - niri 识别窗口 App ID：`com.v1cc0.vcam`。
-- 预览进程、截图和日志临时文件已清理。
 
 ## 下一步
 
