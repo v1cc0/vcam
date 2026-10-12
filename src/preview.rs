@@ -1,10 +1,14 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use gpui_kit::base::Disableable;
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{
+    accordion::Accordion,
     checkbox::Checkbox,
     slider::{Slider, SliderEvent, SliderState},
 };
@@ -15,12 +19,53 @@ use gpui_kit::{
 };
 use image::RgbaImage;
 use v4l::buffer::Type;
+use v4l::control::{Control, Flags as ControlFlags, Value as ControlValue};
 use v4l::io::traits::CaptureStream;
 use v4l::prelude::MmapStream;
 use v4l::video::Capture;
 use v4l::Device;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(33);
+const CAMERA_CONTROL_NAMES: &[&str] = &[
+    "brightness",
+    "contrast",
+    "saturation",
+    "hue",
+    "white_balance_automatic",
+    "gamma",
+    "gain",
+    "power_line_frequency",
+    "white_balance_temperature",
+    "sharpness",
+    "backlight_compensation",
+    "auto_exposure",
+    "exposure_time_absolute",
+];
+
+#[derive(Clone)]
+struct ControlSpec {
+    id: u32,
+    minimum: i64,
+    maximum: i64,
+    step: u64,
+    value: i64,
+    inactive: bool,
+}
+
+struct CameraControls {
+    specs: HashMap<String, ControlSpec>,
+    error: Option<String>,
+}
+
+impl CameraControls {
+    fn spec(&self, name: &str) -> Option<&ControlSpec> {
+        self.specs.get(name)
+    }
+
+    fn value(&self, name: &str, fallback: i64) -> i64 {
+        self.spec(name).map_or(fallback, |spec| spec.value)
+    }
+}
 
 #[derive(Clone)]
 struct CapturedFrame {
@@ -41,6 +86,7 @@ pub(crate) fn run(config: super::Config) -> io::Result<()> {
     let width = config.width;
     let height = config.height;
     let framerate = config.framerate;
+    let rotation = config.rotation;
     let title = format!("vcam Preview - {}", source_path.display());
 
     gpui_kit::application()
@@ -60,7 +106,9 @@ pub(crate) fn run(config: super::Config) -> io::Result<()> {
             };
 
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| PreviewView::new(source_path, width, height, framerate, window, cx))
+                cx.new(|cx| {
+                    PreviewView::new(source_path, width, height, framerate, rotation, window, cx)
+                })
             })
             .expect("failed to open vcam preview window");
         });
@@ -79,6 +127,23 @@ struct PreviewView {
     pending_frame: Option<CapturedFrame>,
     brightness: Entity<SliderState>,
     contrast: Entity<SliderState>,
+    camera_brightness: Entity<SliderState>,
+    camera_contrast: Entity<SliderState>,
+    saturation: Entity<SliderState>,
+    hue: Entity<SliderState>,
+    gamma: Entity<SliderState>,
+    gain: Entity<SliderState>,
+    power_line_frequency: Entity<SliderState>,
+    white_balance_temperature: Entity<SliderState>,
+    sharpness: Entity<SliderState>,
+    auto_exposure: Entity<SliderState>,
+    exposure_time_absolute: Entity<SliderState>,
+    camera_controls: CameraControls,
+    white_balance_automatic: bool,
+    backlight_compensation: bool,
+    control_message: Option<String>,
+    rotation: super::Rotation,
+    open_sections: Vec<usize>,
     flip_horizontal: bool,
     effects_dirty: bool,
     _subscriptions: Vec<Subscription>,
@@ -94,23 +159,29 @@ impl PreviewView {
         requested_width: u32,
         requested_height: u32,
         framerate: u32,
+        rotation: super::Rotation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let brightness = cx.new(|_| {
-            SliderState::new()
-                .min(-1.)
-                .max(1.)
-                .step(0.05)
-                .default_value(0.)
-        });
-        let contrast = cx.new(|_| {
-            SliderState::new()
-                .min(0.)
-                .max(2.)
-                .step(0.05)
-                .default_value(1.)
-        });
+        let camera_controls = discover_camera_controls(&source);
+        let brightness = software_slider(cx, -1., 1., 0., 0.05);
+        let contrast = software_slider(cx, 0., 2., 1., 0.05);
+        let camera_brightness = make_camera_slider(cx, &camera_controls, "brightness", 5.);
+        let camera_contrast = make_camera_slider(cx, &camera_controls, "contrast", 33.);
+        let saturation = make_camera_slider(cx, &camera_controls, "saturation", 48.);
+        let hue = make_camera_slider(cx, &camera_controls, "hue", 0.);
+        let gamma = make_camera_slider(cx, &camera_controls, "gamma", 105.);
+        let gain = make_camera_slider(cx, &camera_controls, "gain", 32.);
+        let power_line_frequency =
+            make_camera_slider(cx, &camera_controls, "power_line_frequency", 1.);
+        let white_balance_temperature =
+            make_camera_slider(cx, &camera_controls, "white_balance_temperature", 4000.);
+        let sharpness = make_camera_slider(cx, &camera_controls, "sharpness", 4.);
+        let auto_exposure = make_camera_slider(cx, &camera_controls, "auto_exposure", 3.);
+        let exposure_time_absolute =
+            make_camera_slider(cx, &camera_controls, "exposure_time_absolute", 313.);
+        let white_balance_automatic = camera_controls.value("white_balance_automatic", 1) != 0;
+        let backlight_compensation = camera_controls.value("backlight_compensation", 0) != 0;
         let subscriptions = vec![
             cx.subscribe_in(&brightness, window, |this, _, _: &SliderEvent, _, cx| {
                 this.effects_dirty = true;
@@ -120,6 +191,86 @@ impl PreviewView {
                 this.effects_dirty = true;
                 cx.notify();
             }),
+            cx.subscribe_in(
+                &camera_brightness,
+                window,
+                |this, _, _: &SliderEvent, _, cx| {
+                    let value = this.camera_brightness.read(cx).value().start().round() as i64;
+                    this.set_camera_control("brightness", value);
+                    cx.notify();
+                },
+            ),
+            cx.subscribe_in(
+                &camera_contrast,
+                window,
+                |this, _, _: &SliderEvent, _, cx| {
+                    let value = this.camera_contrast.read(cx).value().start().round() as i64;
+                    this.set_camera_control("contrast", value);
+                    cx.notify();
+                },
+            ),
+            cx.subscribe_in(&saturation, window, |this, _, _: &SliderEvent, _, cx| {
+                let value = this.saturation.read(cx).value().start().round() as i64;
+                this.set_camera_control("saturation", value);
+                cx.notify();
+            }),
+            cx.subscribe_in(&hue, window, |this, _, _: &SliderEvent, _, cx| {
+                let value = this.hue.read(cx).value().start().round() as i64;
+                this.set_camera_control("hue", value);
+                cx.notify();
+            }),
+            cx.subscribe_in(&gamma, window, |this, _, _: &SliderEvent, _, cx| {
+                let value = this.gamma.read(cx).value().start().round() as i64;
+                this.set_camera_control("gamma", value);
+                cx.notify();
+            }),
+            cx.subscribe_in(&gain, window, |this, _, _: &SliderEvent, _, cx| {
+                let value = this.gain.read(cx).value().start().round() as i64;
+                this.set_camera_control("gain", value);
+                cx.notify();
+            }),
+            cx.subscribe_in(
+                &power_line_frequency,
+                window,
+                |this, _, _: &SliderEvent, _, cx| {
+                    let value = this.power_line_frequency.read(cx).value().start().round() as i64;
+                    this.set_camera_control("power_line_frequency", value);
+                    cx.notify();
+                },
+            ),
+            cx.subscribe_in(
+                &white_balance_temperature,
+                window,
+                |this, _, _: &SliderEvent, _, cx| {
+                    let value = this
+                        .white_balance_temperature
+                        .read(cx)
+                        .value()
+                        .start()
+                        .round() as i64;
+                    this.set_camera_control("white_balance_temperature", value);
+                    cx.notify();
+                },
+            ),
+            cx.subscribe_in(&sharpness, window, |this, _, _: &SliderEvent, _, cx| {
+                let value = this.sharpness.read(cx).value().start().round() as i64;
+                this.set_camera_control("sharpness", value);
+                cx.notify();
+            }),
+            cx.subscribe_in(&auto_exposure, window, |this, _, _: &SliderEvent, _, cx| {
+                let value = this.auto_exposure.read(cx).value().start().round() as i64;
+                this.set_camera_control("auto_exposure", value);
+                cx.notify();
+            }),
+            cx.subscribe_in(
+                &exposure_time_absolute,
+                window,
+                |this, _, _: &SliderEvent, _, cx| {
+                    let value = this.exposure_time_absolute.read(cx).value().start().round() as i64;
+                    this.set_camera_control("exposure_time_absolute", value);
+                    cx.notify();
+                },
+            ),
         ];
         let shared = Arc::new(Mutex::new(SharedPreview {
             latest: None,
@@ -183,6 +334,23 @@ impl PreviewView {
             pending_frame: None,
             brightness,
             contrast,
+            camera_brightness,
+            camera_contrast,
+            saturation,
+            hue,
+            gamma,
+            gain,
+            power_line_frequency,
+            white_balance_temperature,
+            sharpness,
+            auto_exposure,
+            exposure_time_absolute,
+            camera_controls,
+            white_balance_automatic,
+            backlight_compensation,
+            control_message: None,
+            rotation,
+            open_sections: vec![1, 2],
             flip_horizontal: false,
             effects_dirty: false,
             _subscriptions: subscriptions,
@@ -190,6 +358,43 @@ impl PreviewView {
             captured_frames: 0,
             shared,
             _poll_task: poll_task,
+        }
+    }
+
+    fn set_camera_control(&mut self, name: &str, value: i64) {
+        let Some(spec) = self.camera_controls.spec(name) else {
+            return;
+        };
+        let value = value.clamp(spec.minimum, spec.maximum);
+        let result = Device::with_path(&self.source).and_then(|device| {
+            device.set_control(Control {
+                id: spec.id,
+                value: ControlValue::Integer(value),
+            })
+        });
+        match result {
+            Ok(()) => self.control_message = Some(format!("{name} = {value}")),
+            Err(error) => {
+                self.control_message = Some(format!("{name}: {error}"));
+            }
+        }
+    }
+
+    fn set_boolean_control(&mut self, name: &str, value: bool) {
+        let Some(spec) = self.camera_controls.spec(name) else {
+            return;
+        };
+        let result = Device::with_path(&self.source).and_then(|device| {
+            device.set_control(Control {
+                id: spec.id,
+                value: ControlValue::Boolean(value),
+            })
+        });
+        match result {
+            Ok(()) => self.control_message = Some(format!("{name} = {value}")),
+            Err(error) => {
+                self.control_message = Some(format!("{name}: {error}"));
+            }
         }
     }
 }
@@ -221,6 +426,7 @@ impl Render for PreviewView {
                     brightness,
                     contrast,
                     self.flip_horizontal,
+                    self.rotation,
                 )));
             }
             self.effects_dirty = false;
@@ -234,6 +440,7 @@ impl Render for PreviewView {
                     brightness,
                     contrast,
                     self.flip_horizontal,
+                    self.rotation,
                 )));
             }
             self.effects_dirty = false;
@@ -363,31 +570,360 @@ fn side_panel() -> impl IntoElement {
         .child(info_row("Output", "Not connected"))
 }
 
+fn discover_camera_controls(source: &Path) -> CameraControls {
+    let result = (|| -> io::Result<HashMap<String, ControlSpec>> {
+        let device = Device::with_path(source)?;
+        let descriptions = device.query_controls()?;
+        let mut specs = HashMap::new();
+        for description in descriptions {
+            let name = normalize_control_name(&description.name);
+            if !CAMERA_CONTROL_NAMES.contains(&name.as_str()) {
+                continue;
+            }
+            let value = device
+                .control(description.id)
+                .ok()
+                .and_then(|control| match control.value {
+                    ControlValue::Integer(value) => Some(value),
+                    ControlValue::Boolean(value) => Some(i64::from(value)),
+                    _ => None,
+                })
+                .unwrap_or(description.default);
+            let (minimum, maximum) =
+                ordered_control_bounds(description.minimum, description.maximum);
+            specs.insert(
+                name,
+                ControlSpec {
+                    id: description.id,
+                    minimum,
+                    maximum,
+                    step: description.step.max(1),
+                    value,
+                    inactive: description.flags.contains(ControlFlags::INACTIVE),
+                },
+            );
+        }
+        Ok(specs)
+    })();
+
+    match result {
+        Ok(specs) => CameraControls { specs, error: None },
+        Err(error) => CameraControls {
+            specs: HashMap::new(),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn ordered_control_bounds(minimum: i64, maximum: i64) -> (i64, i64) {
+    if minimum <= maximum {
+        (minimum, maximum)
+    } else {
+        (maximum, minimum)
+    }
+}
+
+fn normalize_control_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace([' ', '-'], "_")
+}
+
+fn slider_state(minimum: f32, maximum: f32, step: f32, value: f32) -> SliderState {
+    let mut state = SliderState::new();
+    if minimum > state.max_value() {
+        state = state.max(maximum).min(minimum);
+    } else if maximum < state.min_value() {
+        state = state.min(minimum).max(maximum);
+    } else {
+        state = state.min(minimum).max(maximum);
+    }
+    state.step(step).default_value(value)
+}
+
+fn software_slider(
+    cx: &mut Context<PreviewView>,
+    minimum: f32,
+    maximum: f32,
+    value: f32,
+    step: f32,
+) -> Entity<SliderState> {
+    cx.new(|_| slider_state(minimum, maximum, step, value))
+}
+
+fn make_camera_slider(
+    cx: &mut Context<PreviewView>,
+    controls: &CameraControls,
+    name: &str,
+    fallback: f32,
+) -> Entity<SliderState> {
+    let (minimum, maximum, step, value) =
+        controls
+            .spec(name)
+            .map_or((fallback - 1., fallback + 1., 1., fallback), |spec| {
+                let (minimum, maximum) = ordered_control_bounds(spec.minimum, spec.maximum);
+                (
+                    minimum as f32,
+                    maximum as f32,
+                    spec.step as f32,
+                    (spec.value as f32).clamp(minimum as f32, maximum as f32),
+                )
+            });
+    cx.new(|_| slider_state(minimum, maximum, step, value))
+}
+
 fn control_panel(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl IntoElement {
+    div()
+        .w(px(320.))
+        .flex_shrink_0()
+        .min_h_0()
+        .overflow_y_scrollbar()
+        .flex()
+        .flex_col()
+        .bg(rgb(0x171e27))
+        .border_1()
+        .border_color(rgb(0x2b3542))
+        .p_2()
+        .child(
+            Accordion::new("preview-controls")
+                .multiple(true)
+                .bordered(false)
+                .item(|item| {
+                    item.title("Camera controls")
+                        .open(view.open_sections.contains(&0))
+                        .child(camera_controls(view, cx))
+                })
+                .item(|item| {
+                    item.title("Video filters")
+                        .open(view.open_sections.contains(&1))
+                        .child(video_filters(view, cx))
+                })
+                .item(|item| {
+                    item.title("Software effects")
+                        .open(view.open_sections.contains(&2))
+                        .child(software_effects(view, cx))
+                })
+                .on_toggle_click(cx.listener(|this, open: &[usize], _, cx| {
+                    this.open_sections = open.to_vec();
+                    cx.notify();
+                })),
+        )
+        .when_some(view.control_message.clone(), |element, message| {
+            element.child(
+                div()
+                    .mt_2()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child(message),
+            )
+        })
+}
+
+fn camera_controls(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl IntoElement {
+    let temp_disabled = view
+        .camera_controls
+        .spec("white_balance_temperature")
+        .map_or(true, |spec| spec.inactive && view.white_balance_automatic);
+    let exposure_disabled = view
+        .camera_controls
+        .spec("exposure_time_absolute")
+        .map_or(true, |spec| {
+            spec.inactive && view.auto_exposure.read(cx).value().start().round() == 3.
+        });
+    let controls_available = view.camera_controls.error.is_none();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(camera_slider(
+            "Brightness",
+            view.camera_brightness.read(cx).value().start().round() as i64,
+            Slider::new(&view.camera_brightness)
+                .min_w_0()
+                .disabled(!controls_available),
+            !controls_available,
+        ))
+        .child(camera_slider(
+            "Contrast",
+            view.camera_contrast.read(cx).value().start().round() as i64,
+            Slider::new(&view.camera_contrast)
+                .min_w_0()
+                .disabled(!controls_available),
+            !controls_available,
+        ))
+        .child(camera_slider(
+            "Saturation",
+            view.saturation.read(cx).value().start().round() as i64,
+            Slider::new(&view.saturation)
+                .min_w_0()
+                .disabled(!controls_available),
+            !controls_available,
+        ))
+        .child(camera_slider(
+            "Hue",
+            view.hue.read(cx).value().start().round() as i64,
+            Slider::new(&view.hue)
+                .min_w_0()
+                .disabled(!controls_available),
+            !controls_available,
+        ))
+        .child(
+            Checkbox::new("white-balance-automatic")
+                .checked(view.white_balance_automatic)
+                .disabled(!controls_available)
+                .label("Auto white balance")
+                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                    this.white_balance_automatic = *checked;
+                    this.set_boolean_control("white_balance_automatic", *checked);
+                    cx.notify();
+                })),
+        )
+        .child(camera_slider(
+            "White balance temp",
+            view.white_balance_temperature
+                .read(cx)
+                .value()
+                .start()
+                .round() as i64,
+            Slider::new(&view.white_balance_temperature)
+                .min_w_0()
+                .disabled(temp_disabled),
+            temp_disabled,
+        ))
+        .child(camera_slider(
+            "Gamma",
+            view.gamma.read(cx).value().start().round() as i64,
+            Slider::new(&view.gamma)
+                .min_w_0()
+                .disabled(!controls_available),
+            !controls_available,
+        ))
+        .child(camera_slider(
+            "Gain",
+            view.gain.read(cx).value().start().round() as i64,
+            Slider::new(&view.gain)
+                .min_w_0()
+                .disabled(!controls_available),
+            !controls_available,
+        ))
+        .child(camera_slider(
+            "Power frequency",
+            view.power_line_frequency.read(cx).value().start().round() as i64,
+            Slider::new(&view.power_line_frequency)
+                .min_w_0()
+                .disabled(!controls_available),
+            !controls_available,
+        ))
+        .child(camera_slider(
+            "Sharpness",
+            view.sharpness.read(cx).value().start().round() as i64,
+            Slider::new(&view.sharpness)
+                .min_w_0()
+                .disabled(!controls_available),
+            !controls_available,
+        ))
+        .child(
+            Checkbox::new("backlight-compensation")
+                .checked(view.backlight_compensation)
+                .disabled(!controls_available)
+                .label("Backlight compensation")
+                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                    this.backlight_compensation = *checked;
+                    this.set_camera_control("backlight_compensation", i64::from(*checked));
+                    cx.notify();
+                })),
+        )
+        .child(camera_slider(
+            "Auto exposure mode",
+            view.auto_exposure.read(cx).value().start().round() as i64,
+            Slider::new(&view.auto_exposure)
+                .min_w_0()
+                .disabled(!controls_available),
+            !controls_available,
+        ))
+        .child(camera_slider(
+            "Exposure time",
+            view.exposure_time_absolute.read(cx).value().start().round() as i64,
+            Slider::new(&view.exposure_time_absolute)
+                .min_w_0()
+                .disabled(exposure_disabled),
+            exposure_disabled,
+        ))
+        .when_some(view.camera_controls.error.clone(), |element, error| {
+            element.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xfca5a5))
+                    .child(format!("V4L2 controls unavailable: {error}")),
+            )
+        })
+}
+
+fn video_filters(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(filter_option(
+            "vf-none",
+            "None",
+            view.rotation == super::Rotation::None,
+            super::Rotation::None,
+            cx,
+        ))
+        .child(filter_option(
+            "vf-clockwise",
+            "transpose=clockwise",
+            view.rotation == super::Rotation::Clockwise,
+            super::Rotation::Clockwise,
+            cx,
+        ))
+        .child(filter_option(
+            "vf-counter-clockwise",
+            "transpose=counter-clockwise",
+            view.rotation == super::Rotation::CounterClockwise,
+            super::Rotation::CounterClockwise,
+            cx,
+        ))
+        .child(filter_option(
+            "vf-half-turn",
+            "transpose=1,transpose=1",
+            view.rotation == super::Rotation::HalfTurn,
+            super::Rotation::HalfTurn,
+            cx,
+        ))
+        .child(filter_option(
+            "vf-hflip",
+            "hflip",
+            view.rotation == super::Rotation::HorizontalFlip,
+            super::Rotation::HorizontalFlip,
+            cx,
+        ))
+        .child(filter_option(
+            "vf-vflip",
+            "vflip",
+            view.rotation == super::Rotation::VerticalFlip,
+            super::Rotation::VerticalFlip,
+            cx,
+        ))
+}
+
+fn software_effects(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl IntoElement {
     let brightness = view.brightness.read(cx).value().start();
     let contrast = view.contrast.read(cx).value().start();
 
     div()
-        .w(px(240.))
-        .flex_shrink_0()
-        .min_h_0()
         .flex()
         .flex_col()
-        .gap_3()
-        .bg(rgb(0x171e27))
-        .border_1()
-        .border_color(rgb(0x2b3542))
-        .p_3()
-        .child(section_title("Effects"))
+        .gap_2()
         .child(effect_slider(
             "Brightness",
             format!("{brightness:+.2}"),
-            Slider::new(&view.brightness).w(px(190.)),
+            Slider::new(&view.brightness).w(px(220.)),
         ))
         .child(effect_slider(
             "Contrast",
             format!("{contrast:.2}"),
-            Slider::new(&view.contrast).w(px(190.)),
+            Slider::new(&view.contrast).w(px(220.)),
         ))
         .child(
             Checkbox::new("flip-horizontal")
@@ -399,17 +935,71 @@ fn control_panel(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl Into
                     cx.notify();
                 })),
         )
-        .child(section_title("Camera"))
-        .child(info_row("Input", "V4L2 camera"))
-        .child(info_row("Exposure", "Auto"))
-        .child(info_row("Gain", "Auto"))
         .child(
             div()
-                .mt_2()
                 .text_xs()
                 .text_color(rgb(0x64748b))
-                .child("Controls affect the lower processed preview."),
+                .child("Only the lower preview uses software effects."),
         )
+}
+
+fn camera_slider<E: IntoElement>(
+    label: &'static str,
+    value: i64,
+    slider: E,
+    _disabled: bool,
+) -> impl IntoElement {
+    effect_slider(label, control_display(label, value), slider)
+}
+
+fn control_display(label: &str, value: i64) -> String {
+    match label {
+        "Power frequency" => match value {
+            0 => "Disabled".to_string(),
+            1 => "50 Hz".to_string(),
+            2 => "60 Hz".to_string(),
+            _ => value.to_string(),
+        },
+        "Auto exposure mode" => match value {
+            0 => "Manual".to_string(),
+            1 => "Auto".to_string(),
+            2 => "Shutter priority".to_string(),
+            3 => "Aperture priority".to_string(),
+            _ => value.to_string(),
+        },
+        _ => value.to_string(),
+    }
+}
+
+fn filter_option(
+    id: &'static str,
+    label: &'static str,
+    selected: bool,
+    rotation: super::Rotation,
+    cx: &mut Context<PreviewView>,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .text_sm()
+        .text_color(if selected {
+            rgb(0x7dd3fc)
+        } else {
+            rgb(0xcbd5e1)
+        })
+        .bg(if selected {
+            rgb(0x243b53)
+        } else {
+            rgb(0x1d2733)
+        })
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.rotation = rotation;
+            this.effects_dirty = true;
+            cx.notify();
+        }))
+        .child(label)
 }
 
 fn effect_slider<E: IntoElement>(
@@ -620,6 +1210,7 @@ fn apply_effects(
     brightness: f32,
     contrast: f32,
     flip_horizontal: bool,
+    rotation: super::Rotation,
 ) -> CapturedFrame {
     let mut bgra = frame.bgra.clone();
     for pixel in bgra.chunks_exact_mut(4) {
@@ -640,9 +1231,45 @@ fn apply_effects(
             }
         }
     }
-    CapturedFrame {
+    let processed = CapturedFrame {
         width: frame.width,
         height: frame.height,
+        bgra,
+    };
+    apply_video_filter(&processed, rotation)
+}
+
+fn apply_video_filter(frame: &CapturedFrame, rotation: super::Rotation) -> CapturedFrame {
+    if rotation == super::Rotation::None {
+        return frame.clone();
+    }
+    let (width, height) = match rotation {
+        super::Rotation::Clockwise | super::Rotation::CounterClockwise => {
+            (frame.height, frame.width)
+        }
+        _ => (frame.width, frame.height),
+    };
+    let mut bgra = vec![0; (width * height * 4) as usize];
+    for y in 0..frame.height as usize {
+        for x in 0..frame.width as usize {
+            let (dx, dy) = match rotation {
+                super::Rotation::Clockwise => (frame.height as usize - 1 - y, x),
+                super::Rotation::CounterClockwise => (y, frame.width as usize - 1 - x),
+                super::Rotation::HalfTurn => {
+                    (frame.width as usize - 1 - x, frame.height as usize - 1 - y)
+                }
+                super::Rotation::HorizontalFlip => (frame.width as usize - 1 - x, y),
+                super::Rotation::VerticalFlip => (x, frame.height as usize - 1 - y),
+                super::Rotation::None => (x, y),
+            };
+            let source = (y * frame.width as usize + x) * 4;
+            let target = (dy * width as usize + dx) * 4;
+            bgra[target..target + 4].copy_from_slice(&frame.bgra[source..source + 4]);
+        }
+    }
+    CapturedFrame {
+        width,
+        height,
         bgra,
     }
 }
@@ -656,7 +1283,25 @@ fn render_image(frame: CapturedFrame) -> Arc<RenderImage> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_effects, yuyv_to_bgra, CapturedFrame};
+    use super::{apply_effects, slider_state, yuyv_to_bgra, CapturedFrame};
+    use crate::Rotation;
+
+    #[test]
+    fn control_bounds_are_ordered() {
+        assert_eq!(super::ordered_control_bounds(2800, 100), (100, 2800));
+        assert_eq!(super::ordered_control_bounds(100, 2800), (100, 2800));
+    }
+
+    #[test]
+    fn slider_state_accepts_ranges_outside_gpui_defaults() {
+        let high = slider_state(2800., 6500., 1., 4000.);
+        assert_eq!(high.min_value(), 2800.);
+        assert_eq!(high.max_value(), 6500.);
+
+        let low = slider_state(-6500., -2800., 1., -4000.);
+        assert_eq!(low.min_value(), -6500.);
+        assert_eq!(low.max_value(), -2800.);
+    }
 
     #[test]
     fn effects_change_only_processed_frame_and_can_flip_it() {
@@ -666,7 +1311,7 @@ mod tests {
             bgra: vec![10, 20, 30, 255, 200, 210, 220, 255],
         };
 
-        let processed = apply_effects(&frame, 0.1, 1.0, true);
+        let processed = apply_effects(&frame, 0.1, 1.0, true, Rotation::None);
 
         assert_eq!(frame.bgra, vec![10, 20, 30, 255, 200, 210, 220, 255]);
         assert_eq!(processed.bgra, vec![226, 236, 246, 255, 36, 46, 56, 255]);

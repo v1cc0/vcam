@@ -33,7 +33,7 @@ Open the GPUI Kit AMCap-style live preview without creating a loopback output:
 cargo run --release -- --preview --source /dev/video1 --width 1280 --height 720 --framerate 30
 ```
 
-The preview owns the physical V4L2 capture device and displays the latest decoded frame in a split central workspace: the upper pane shows the original `/dev/video*` capture and the lower pane shows the processed result. The right panel provides live brightness, contrast, and horizontal-flip controls for the lower pane; `vcam run` remains the OBS loopback path.
+The preview owns the physical V4L2 capture device and displays the latest decoded frame in a split central workspace: the upper pane shows the original `/dev/video*` capture and the lower pane shows the processed result. The right panel is divided into collapsible camera controls, video filters, and software effects. It exposes brightness, contrast, saturation, hue, automatic white balance, white-balance temperature, gamma, gain, power-line frequency, sharpness, backlight compensation, auto-exposure mode, and exposure time when the selected V4L2 device provides them. Camera controls write back to the device; `--vf transpose=1|2|hflip|vflip` is also available in the preview filter section, while software brightness, contrast, and horizontal flip affect only the lower pane. `vcam run` remains the OBS loopback path.
 
 List V4L2 nodes and capabilities:
 

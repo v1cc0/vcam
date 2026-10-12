@@ -27,12 +27,20 @@
 ## 已完成：上下分屏与效果控制
 
 - 使用 `src/preview.rs` 将同一最新采集帧分别渲染为原始帧和效果帧。
-- 右侧滑块和复选框通过 GPUI 事件订阅驱动下方画面重算。
+- 右侧滑块和复选框通过 GPUI 事件订阅驱动下方画面重算；软件效果与硬件 V4L2 控件分离。
+- 从选定的 V4L2 设备枚举并绑定亮度、对比度、饱和度、色调、自动白平衡、白平衡温度、Gamma、增益、电源频率、锐度、逆光补偿、自动曝光和曝光时间；控件范围会在进入 GPUI 前归一化。
+- 右侧面板按 Camera controls、Video filters、Software effects 分组并可折叠，缺失或不可用的设备控件不会阻止预览启动。
+- 预览滤镜提供 `none`、`transpose=1`、`transpose=2`、`hflip` 和 `vflip`，效果只作用于下方处理画面。
 - `/dev/video1`、`640x480@15` Wayland 截图验证通过：上下预览、左侧设备栏、右侧效果栏互不覆盖；niri 继续识别 `com.v1cc0.vcam`。
 
+## 第二轮验证
+
+- `cargo fmt --all -- --check`、`cargo check`、`cargo test` 和 `git diff --check` 通过。
+- `cargo test`：21 个测试通过，新增 GPUI 滑块范围和反向 V4L2 控件边界回归测试。
+- `/dev/video1` 的真实 Wayland smoke test（`640x480@15`）启动无 panic、无日志错误，采集帧数持续增长；niri 识别 App ID `com.v1cc0.vcam`。
+- 截图确认左侧设备栏、中间原始/处理上下预览、右侧固定宽度折叠控制面板互不覆盖；预览进程和临时文件已清理。
 ## 下一步
 
-- 从 V4L2 枚举并绑定曝光、增益、亮度、对比度、饱和度等真实控制项。
 - 增加设备选择、源格式/分辨率/FPS 选择、截图、录制和输出到 loopback 的交互。
 - 对 GPUI 图像上传的 CPU/内存成本做 30 秒测量；超过预算时再评估独立视频 surface 或低分辨率 UI 预览。
 - 使用真实摄像头完成窗口截图和 30 秒稳定性验证。
