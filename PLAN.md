@@ -9,9 +9,9 @@
 - 接入 `gpui-kit 0.7.1` 与 RGBA/BGRA 图像依赖，锁文件已更新。
 - 新增 `src/preview.rs`，采集线程独占 V4L2 设备，GPUI 线程只消费最新帧。
 - `vcam --preview [options]` 选择物理摄像头，支持现有 MJPEG/YUYV 输入并显示实时画面。
-- 实现纯黑背景、纯白文字的 AMCap 风格工作区：顶部设备/格式信息、中央上下分屏预览（上方原始帧、下方处理帧）、左侧设备信息、右侧效果控制和底部状态栏。
-- 右侧接入亮度、对比度和水平翻转控件，仅作用于下方处理预览；原始帧保持不变。
-- `Camera controls` 分组提供 `Reset camera defaults` 按钮，按 V4L2 驱动报告的默认值恢复可用硬件参数，并同步滑块和复选框状态。
+- 实现纯黑背景、纯白文字的 AMCap 风格工作区：顶部设备/格式信息、中央左右分屏预览（左侧原始帧、右侧处理帧）、左侧设备与 Camera controls、右侧软件效果控制和底部状态栏。
+- 右侧 Software effects 接入亮度、对比度滑块和旋转/翻转下拉菜单，仅作用于右侧处理预览；原始帧保持不变。
+- `Camera controls` 已移入左侧 Device/Capture/Output 信息下方，提供 `Reset camera defaults` 按钮，按 V4L2 驱动报告的默认值恢复可用硬件参数，并同步滑块和复选框状态。
 - 中间预览列和图像元素设置明确的 flex 收缩边界，防止原始图像覆盖右侧面板。
 - 原始/处理两套动态 GPUI 图像都在替换前显式回收旧 atlas 资源。
 - 关闭窗口时通知采集线程退出；现有 `vcam run`、`list`、`snapshot`、`bench` 行为未改。
@@ -21,25 +21,24 @@
 - `cargo fmt --all -- --check` 通过。
 - `cargo check` 通过。
 - `cargo build --release` 通过。
-- `cargo test`：18 个测试通过，包含 YUYV 预览颜色转换回归测试。
+- `cargo test`：22 个测试通过，包含 YUYV 预览颜色转换及下拉映射回归测试。
 - `vcam --help` 能列出 `vcam --preview [options]`。
 - 使用 `/dev/video1`、`640x480@15` 做短时 GUI smoke test，窗口事件循环保持运行 12 秒，无采集/窗口错误输出。
 
-## 已完成：上下分屏与效果控制
+## 已完成：左右分屏与合并效果菜单
 
-- 使用 `src/preview.rs` 将同一最新采集帧分别渲染为原始帧和效果帧。
-- 右侧滑块和复选框通过 GPUI 事件订阅驱动下方画面重算；软件效果与硬件 V4L2 控件分离。
-- 从选定的 V4L2 设备枚举并绑定亮度、对比度、饱和度、色调、自动白平衡、白平衡温度、Gamma、增益、电源频率、锐度、逆光补偿、自动曝光和曝光时间；控件范围会在进入 GPUI 前归一化。
-- 右侧面板按 Camera controls、Video filters、Software effects 分组并可折叠，缺失或不可用的设备控件不会阻止预览启动。
-- 预览滤镜提供 `none`、`transpose=1`、`transpose=2`、`hflip` 和 `vflip`，效果只作用于下方处理画面。
-- `/dev/video1`、`640x480@15` Wayland 截图验证通过：上下预览、左侧设备栏、右侧效果栏互不覆盖；niri 继续识别 `com.v1cc0.vcam`。
+- 中央预览改为左右布局：左侧显示原始帧，右侧显示处理帧；旋转滤镜选择后可获得更大的横向观察区域。
+- 左侧 Camera controls 保留全部 V4L2 控件和默认值恢复；右侧只保留 Software effects。
+- Video filters 已并入 Software effects，以 Video rotation 和 Flip 两个下拉菜单提供 None、顺/逆时针、半转、水平/垂直翻转选项；亮度和对比度继续使用连续滑块。
+- 下拉选择会同步相互排他的旋转/翻转状态，避免界面显示过期选项。
+
 
 ## 第二轮验证
 
 - `cargo fmt --all -- --check`、`cargo check`、`cargo test` 和 `git diff --check` 通过。
-- `cargo test`：21 个测试通过，新增 GPUI 滑块范围和反向 V4L2 控件边界回归测试。
+- `cargo test`：22 个测试通过，新增 GPUI 滑块范围、反向 V4L2 控件边界和下拉索引映射回归测试。
 - `/dev/video1` 的真实 Wayland smoke test（`640x480@15`）启动无 panic、无日志错误，采集帧数持续增长；niri 识别 App ID `com.v1cc0.vcam`。
-- 截图确认左侧设备栏、中间原始/处理上下预览、右侧固定宽度折叠控制面板互不覆盖；预览进程和临时文件已清理。
+- 截图确认左侧设备栏及 Camera controls、中间原始/处理左右预览、右侧 Software effects 互不覆盖；预览进程和临时文件已清理。
 ## 下一步
 
 - 增加设备选择、源格式/分辨率/FPS 选择、截图、录制和输出到 loopback 的交互。

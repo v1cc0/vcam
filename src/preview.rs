@@ -11,7 +11,10 @@ use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::{
     accordion::Accordion,
     checkbox::Checkbox,
+    searchable_list::SearchableVec,
+    select::{Select, SelectEvent, SelectState},
     slider::{Slider, SliderEvent, SliderState},
+    IndexPath,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -27,6 +30,7 @@ use v4l::video::Capture;
 use v4l::Device;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(33);
+type EffectOptions = SearchableVec<&'static str>;
 const CAMERA_CONTROL_NAMES: &[&str] = &[
     "brightness",
     "contrast",
@@ -184,7 +188,10 @@ struct PreviewView {
     backlight_compensation: bool,
     control_message: Option<String>,
     rotation: super::Rotation,
-    open_sections: Vec<usize>,
+    rotation_select: Entity<SelectState<EffectOptions>>,
+    flip_select: Entity<SelectState<EffectOptions>>,
+    camera_controls_open: bool,
+    software_effects_open: bool,
     flip_horizontal: bool,
     effects_dirty: bool,
     _subscriptions: Vec<Subscription>,
@@ -223,6 +230,22 @@ impl PreviewView {
             make_camera_slider(cx, &camera_controls, "exposure_time_absolute", 313.);
         let white_balance_automatic = camera_controls.value("white_balance_automatic", 1) != 0;
         let backlight_compensation = camera_controls.value("backlight_compensation", 0) != 0;
+        let rotation_select = cx.new(|cx| {
+            SelectState::new(
+                rotation_options(),
+                Some(IndexPath::new(rotation_index(rotation))),
+                window,
+                cx,
+            )
+        });
+        let flip_select = cx.new(|cx| {
+            SelectState::new(
+                flip_options(),
+                Some(IndexPath::new(flip_index(rotation))),
+                window,
+                cx,
+            )
+        });
         let subscriptions = vec![
             cx.subscribe_in(&brightness, window, |this, _, _: &SliderEvent, _, cx| {
                 this.effects_dirty = true;
@@ -312,6 +335,45 @@ impl PreviewView {
                     cx.notify();
                 },
             ),
+            cx.subscribe_in(
+                &rotation_select,
+                window,
+                |this, _, event: &SelectEvent<EffectOptions>, window, cx| {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        this.rotation = match *value {
+                            "Clockwise" => super::Rotation::Clockwise,
+                            "Counter-clockwise" => super::Rotation::CounterClockwise,
+                            "Half turn" => super::Rotation::HalfTurn,
+                            _ => super::Rotation::None,
+                        };
+                        this.flip_select.update(cx, |state, cx| {
+                            state.set_selected_value(&"None", window, cx);
+                        });
+                        this.flip_horizontal = false;
+                        this.effects_dirty = true;
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &flip_select,
+                window,
+                |this, _, event: &SelectEvent<EffectOptions>, window, cx| {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        this.rotation = match *value {
+                            "Horizontal" => super::Rotation::HorizontalFlip,
+                            "Vertical" => super::Rotation::VerticalFlip,
+                            _ => super::Rotation::None,
+                        };
+                        this.rotation_select.update(cx, |state, cx| {
+                            state.set_selected_value(&"None", window, cx);
+                        });
+                        this.flip_horizontal = false;
+                        this.effects_dirty = true;
+                        cx.notify();
+                    }
+                },
+            ),
         ];
         let shared = Arc::new(Mutex::new(SharedPreview {
             latest: None,
@@ -391,7 +453,10 @@ impl PreviewView {
             backlight_compensation,
             control_message: None,
             rotation,
-            open_sections: vec![1, 2],
+            rotation_select,
+            flip_select,
+            camera_controls_open: true,
+            software_effects_open: true,
             flip_horizontal: false,
             effects_dirty: false,
             _subscriptions: subscriptions,
@@ -619,7 +684,7 @@ impl Render for PreviewView {
                     .flex()
                     .gap_3()
                     .p_3()
-                    .child(side_panel())
+                    .child(side_panel(self, cx))
                     .child(
                         div()
                             .flex_1()
@@ -628,11 +693,20 @@ impl Render for PreviewView {
                             .flex()
                             .flex_col()
                             .gap_2()
-                            .child(preview_pane(
-                                format!("Original {}", self.source.display()),
-                                original,
-                            ))
-                            .child(preview_pane("After effects".to_string(), processed))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .min_h_0()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child(preview_pane(
+                                        format!("Original {}", self.source.display()),
+                                        original,
+                                    ))
+                                    .child(preview_pane("After effects".to_string(), processed)),
+                            )
                             .child(
                                 div()
                                     .h(px(30.))
@@ -644,7 +718,7 @@ impl Render for PreviewView {
                                     .text_xs()
                                     .text_color(rgb(0xffffff))
                                     .child(self.status.clone())
-                                    .child("Live capture · processed preview below"),
+                                    .child("Live capture · processed preview on the right"),
                             ),
                     )
                     .child(control_panel(self, cx)),
@@ -667,9 +741,12 @@ impl Render for PreviewView {
     }
 }
 
-fn side_panel() -> impl IntoElement {
+fn side_panel(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl IntoElement {
     div()
-        .w(px(220.))
+        .w(px(320.))
+        .flex_shrink_0()
+        .min_h_0()
+        .overflow_y_scrollbar()
         .flex()
         .flex_col()
         .gap_3()
@@ -685,6 +762,27 @@ fn side_panel() -> impl IntoElement {
         .child(info_row("Exposure", "Auto"))
         .child(info_row("Gain", "Auto"))
         .child(info_row("Output", "Not connected"))
+        .child(
+            Accordion::new("camera-controls-left")
+                .multiple(true)
+                .bordered(false)
+                .item(|item| {
+                    item.title("Camera controls")
+                        .open(view.camera_controls_open)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(reset_camera_button(cx))
+                                .child(camera_controls(view, cx)),
+                        )
+                })
+                .on_toggle_click(cx.listener(|this, open: &[usize], _, cx| {
+                    this.camera_controls_open = open.contains(&0);
+                    cx.notify();
+                })),
+        )
 }
 
 fn discover_camera_controls(source: &Path) -> CameraControls {
@@ -790,6 +888,21 @@ fn make_camera_slider(
     cx.new(|_| slider_state(minimum, maximum, step, value))
 }
 
+fn reset_camera_button(cx: &mut Context<PreviewView>) -> impl IntoElement {
+    Button::new("reset-camera-defaults")
+        .accessibility_label("Reset camera defaults")
+        .px_2()
+        .py_1()
+        .border_1()
+        .border_color(rgb(0xffffff))
+        .text_color(rgb(0xffffff))
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.reset_camera_defaults(window, cx);
+            cx.notify();
+        }))
+        .child("Reset camera defaults")
+}
+
 fn control_panel(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl IntoElement {
     div()
         .w(px(320.))
@@ -803,40 +916,16 @@ fn control_panel(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl Into
         .border_color(rgb(0xffffff))
         .p_2()
         .child(
-            Button::new("reset-camera-defaults")
-                .accessibility_label("Reset camera defaults")
-                .px_2()
-                .py_1()
-                .border_1()
-                .border_color(rgb(0xffffff))
-                .text_color(rgb(0xffffff))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.reset_camera_defaults(window, cx);
-                    cx.notify();
-                }))
-                .child("Reset camera defaults"),
-        )
-        .child(
-            Accordion::new("preview-controls")
+            Accordion::new("software-effects-panel")
                 .multiple(true)
                 .bordered(false)
                 .item(|item| {
-                    item.title("Camera controls")
-                        .open(view.open_sections.contains(&0))
-                        .child(camera_controls(view, cx))
-                })
-                .item(|item| {
-                    item.title("Video filters")
-                        .open(view.open_sections.contains(&1))
-                        .child(video_filters(view, cx))
-                })
-                .item(|item| {
                     item.title("Software effects")
-                        .open(view.open_sections.contains(&2))
+                        .open(view.software_effects_open)
                         .child(software_effects(view, cx))
                 })
                 .on_toggle_click(cx.listener(|this, open: &[usize], _, cx| {
-                    this.open_sections = open.to_vec();
+                    this.software_effects_open = open.contains(&0);
                     cx.notify();
                 })),
         )
@@ -992,53 +1081,31 @@ fn camera_controls(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl In
         })
 }
 
-fn video_filters(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(filter_option(
-            "vf-none",
-            "None",
-            view.rotation == super::Rotation::None,
-            super::Rotation::None,
-            cx,
-        ))
-        .child(filter_option(
-            "vf-clockwise",
-            "transpose=clockwise",
-            view.rotation == super::Rotation::Clockwise,
-            super::Rotation::Clockwise,
-            cx,
-        ))
-        .child(filter_option(
-            "vf-counter-clockwise",
-            "transpose=counter-clockwise",
-            view.rotation == super::Rotation::CounterClockwise,
-            super::Rotation::CounterClockwise,
-            cx,
-        ))
-        .child(filter_option(
-            "vf-half-turn",
-            "transpose=1,transpose=1",
-            view.rotation == super::Rotation::HalfTurn,
-            super::Rotation::HalfTurn,
-            cx,
-        ))
-        .child(filter_option(
-            "vf-hflip",
-            "hflip",
-            view.rotation == super::Rotation::HorizontalFlip,
-            super::Rotation::HorizontalFlip,
-            cx,
-        ))
-        .child(filter_option(
-            "vf-vflip",
-            "vflip",
-            view.rotation == super::Rotation::VerticalFlip,
-            super::Rotation::VerticalFlip,
-            cx,
-        ))
+fn rotation_options() -> EffectOptions {
+    SearchableVec::new(["None", "Clockwise", "Counter-clockwise", "Half turn"])
+}
+
+fn flip_options() -> EffectOptions {
+    SearchableVec::new(["None", "Horizontal", "Vertical"])
+}
+
+fn rotation_index(rotation: super::Rotation) -> usize {
+    match rotation {
+        super::Rotation::None | super::Rotation::HorizontalFlip | super::Rotation::VerticalFlip => {
+            0
+        }
+        super::Rotation::Clockwise => 1,
+        super::Rotation::CounterClockwise => 2,
+        super::Rotation::HalfTurn => 3,
+    }
+}
+
+fn flip_index(rotation: super::Rotation) -> usize {
+    match rotation {
+        super::Rotation::HorizontalFlip => 1,
+        super::Rotation::VerticalFlip => 2,
+        _ => 0,
+    }
 }
 
 fn software_effects(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl IntoElement {
@@ -1049,6 +1116,8 @@ fn software_effects(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl I
         .flex()
         .flex_col()
         .gap_2()
+        .child(effect_select("Video rotation", &view.rotation_select))
+        .child(effect_select("Flip", &view.flip_select))
         .child(effect_slider(
             "Brightness",
             format!("{brightness:+.2}"),
@@ -1060,20 +1129,28 @@ fn software_effects(view: &PreviewView, cx: &mut Context<PreviewView>) -> impl I
             Slider::new(&view.contrast).w(px(220.)),
         ))
         .child(
-            Checkbox::new("flip-horizontal")
-                .checked(view.flip_horizontal)
-                .label("Horizontal flip")
-                .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                    this.flip_horizontal = *checked;
-                    this.effects_dirty = true;
-                    cx.notify();
-                })),
-        )
-        .child(
             div()
                 .text_xs()
                 .text_color(rgb(0xffffff))
-                .child("Only the lower preview uses software effects."),
+                .child("Only the processed preview uses software effects."),
+        )
+}
+
+fn effect_select(
+    label: &'static str,
+    state: &Entity<SelectState<EffectOptions>>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(div().text_sm().child(label))
+        .child(
+            Select::new(state)
+                .id(format!("effect-select-{label}"))
+                .w_full()
+                .h(px(32.))
+                .accessibility_label(label),
         )
 }
 
@@ -1103,35 +1180,6 @@ fn control_display(label: &str, value: i64) -> String {
         },
         _ => value.to_string(),
     }
-}
-
-fn filter_option(
-    id: &'static str,
-    label: &'static str,
-    selected: bool,
-    rotation: super::Rotation,
-    cx: &mut Context<PreviewView>,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .px_2()
-        .py_1()
-        .rounded_sm()
-        .text_sm()
-        .text_color(rgb(0xffffff))
-        .bg(rgb(0x000000))
-        .border_1()
-        .border_color(if selected {
-            rgb(0xffffff)
-        } else {
-            rgb(0x000000)
-        })
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.rotation = rotation;
-            this.effects_dirty = true;
-            cx.notify();
-        }))
-        .child(label)
 }
 
 fn effect_slider<E: IntoElement>(
@@ -1433,6 +1481,17 @@ mod tests {
         let low = slider_state(-6500., -2800., 1., -4000.);
         assert_eq!(low.min_value(), -6500.);
         assert_eq!(low.max_value(), -2800.);
+    }
+
+    #[test]
+    fn effect_dropdown_indices_match_rotation_modes() {
+        assert_eq!(super::rotation_index(Rotation::None), 0);
+        assert_eq!(super::rotation_index(Rotation::Clockwise), 1);
+        assert_eq!(super::rotation_index(Rotation::CounterClockwise), 2);
+        assert_eq!(super::rotation_index(Rotation::HalfTurn), 3);
+        assert_eq!(super::flip_index(Rotation::None), 0);
+        assert_eq!(super::flip_index(Rotation::HorizontalFlip), 1);
+        assert_eq!(super::flip_index(Rotation::VerticalFlip), 2);
     }
 
     #[test]
