@@ -1,31 +1,33 @@
 # Progress
 
-## 本轮完成
+## 本轮方向与完成
 
-- 将 `Camera controls` 从右侧移到左侧 Device/Capture/Output 信息下方，保留默认值恢复按钮和全部 V4L2 控件。
-- 将中央 Original/After effects 预览从上下分屏改为左右分屏，左侧显示原始帧，右侧显示处理帧。
-- 将 Video filters 合并进右侧 `Software effects`，改用 `Video rotation` 和 `Flip` 两个下拉菜单；亮度、对比度继续使用滑块。
-- 旋转与翻转下拉选择会同步相互排他的状态，避免界面显示旧选项。
-- 更新 README 和 PLAN；保留纯黑背景、纯白文字、GPUI 图像资源回收及 `vcam run` 行为。
+- 按上轮下一步完成 GPUI 预览 CPU / RSS / GPU 内存测量，未改动应用代码或依赖。
+- 真实摄像头完成 `640x480` 120 秒、`1280x720` 180 秒和 `1280x720` 顺时针旋转 120 秒；另用固定 30 FPS 的 YUYV 测试图完成旋转预览 120 秒，共 9 分钟。
+- 排除启动 10 秒后，RSS 峰值 155 MiB，驱动报告的 VRAM + GTT 峰值约 122.3 MiB，进程 CPU 峰值为单个逻辑核心的 65%；未观察到 GPU 内存按帧累积。
+- 测试图 RSS 初期增长后稳定在 155 MiB，最后 30 个样本保持该值。测试期间允许桌面交互，未锁定窗口可见性，CPU 平均值不能当作持续可见的 30 FPS 预算。
+- 将环境、采样方法、完整结果表和限制记入 `PLAN.md`；本轮无需为资源占用改写预览路径。
 
-## 验证
+## 验证与发现
 
-- `cargo fmt --all -- --check` 通过。
-- `cargo check` 通过。
-- `cargo test`：22 项全部通过，包含下拉索引映射回归测试。
-- `cargo build --release` 通过。
-- `git diff --check` 通过。
-- `/dev/video1` release Wayland smoke test 无日志错误，niri 识别 App ID `com.v1cc0.vcam`。
-- 默认状态截图确认左侧 Camera controls、中间左右双画面和右侧 Software effects 无覆盖。
-- 使用 `--vf transpose=1` 启动的截图确认右侧处理画面旋转为横向显示，左右分屏保持稳定。
+- `cargo fmt --all -- --check`、`cargo build --release --locked`、`cargo test --release --locked` 和 `git diff --check` 通过，22 项测试全部通过。
+- 四组 Wayland 截图确认原始/处理画面更新、旋转正确且面板互不覆盖；四次关闭窗口均以状态 0 正常退出。
+- 预览日志无采集/窗口错误；测试时间段内无新增 amdgpu、OOM 或 GPU reset 内核错误。
+- 当前 `/dev/video0` 是物理图像节点，`/dev/video1` 是元数据节点；设备编号须每轮重新枚举。
+- 当前真实摄像头的观测采集帧率约 10 FPS，驱动协商值为 30 FPS；请求 15 FPS 时驱动仍返回 30 FPS。原因未定位，界面目前显示请求值，需要跟进。
+- 测试图的帧计数差对应约 29.8 FPS；未单独统计 UI 呈现 FPS，未验证真实 MJPEG 30 FPS 或小时级运行。
+- 清理时误用采集端帧率参数，随后改用 `--set-output-parm`；确认 loopback 恢复原来的 `640x480 BGR4 @ 30 FPS`，摄像头硬件控制未调整。
 
 ## 下一步
 
-- 后续再考虑设备选择、源格式/分辨率/FPS 选择、截图、录制和 loopback 输出。
-- 对 GPUI 图像上传做更长时间 CPU/内存测量。
+- 增加 GUI 设备、源格式、分辨率和 FPS 选择，并区分请求值、驱动协商值与实测采集 FPS。
+- 后续接入截图、录制和 loopback 输出交互。
+- 补充真实 MJPEG 30 FPS、持续可见窗口和小时级资源测量。
 
-## 用户文件
+## 本地文件与历史
 
+- 上轮左右分屏、左侧 Camera controls、右侧 Software effects 已完成，详见提交 `1d04c9d` 及 `PLAN.md`。
 - `background.pgm` 保持未跟踪、未修改，不加入提交。
-- `Cargo.lock` 的既有未提交修改保持原样，不纳入本轮提交。
-- `PROGRESS.md.lastround` 是本轮本地备份，保持忽略。
+- `Cargo.lock` 本轮未修改；当前锁文件解析到 `gpui-kit 0.7.3`。
+- 进度、事故和代理说明文件只保留本地；已有跟踪的进度记录随本地提交保存，不执行推送。
+- 最新进度同步备份到 `PROGRESS.md.lastround`；测量脚本、日志和截图已清理。
